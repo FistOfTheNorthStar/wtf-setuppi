@@ -1,0 +1,1283 @@
+#!/usr/bin/env bash
+#
+# wt — a generic git-worktree manager, configured via wt.yml.
+#
+# Config is read from (first match wins):
+#   1. $WT_CONFIG                       explicit path to a wt.yml
+#   2. wt.yml next to this script
+#   3. wt.yml in $PWD, then walking up parent directories
+# Individual keys can also be overridden by env vars (WT_BASE_REPO, etc).
+#
+# Commands:
+#   wt create <slug> [--from <branch>]   create a worktree named <date>-N-<slug>
+#                                        (branch off latest main, or off <branch>
+#                                        with --from; use --raw to name it verbatim)
+#   wt delete <name> [--force] [--keep-branch]
+#                                        remove a worktree (and its branch)
+#   wt clean --merged|--gone [--dry-run] [--yes]
+#                                        remove finished worktrees in bulk
+#   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
+#   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
+#   wt exec <name> -- <cmd>              run a command inside one worktree
+#   wt each [--keep-going] -- <cmd>      run a command inside every worktree
+#   wt activate <name>                   make <name> the active worktree
+#   wt active [--path]                   print the active worktree
+#   wt path <name>                       print a worktree's path
+#   wt update                            fetch remote and fast-forward main in the base repo
+#   wt list [--json]                     list worktrees with status
+#   wt gitignore [--check]               sync the .gitignore rule for dir_prefix
+#   wt config                            show the resolved configuration
+#
+# Worktree directories are named <dir_prefix><name> (dir_prefix defaults to
+# "wt-"), so a single .gitignore rule like "wt-*/" hides every worktree at once.
+# Branch names are never prefixed — only the directory on disk is.
+#
+# That rule is derived from dir_prefix and written into a managed block in the
+# .gitignore of the repo containing worktree_root — refreshed on every `create`,
+# or on demand with `wt gitignore`. Set manage_gitignore: false to opt out.
+#
+# Running several agents in parallel:
+#   - copy:/link: seed each worktree with the ignored files it needs (.env,
+#     .venv, node_modules) so it is usable the moment it is created.
+#   - every worktree gets a stable small integer (WT_INDEX) and, if port_base
+#     is set, a private port range (WT_PORT_BASE) — written to .wt.env and
+#     passed to post_create, exec and each.
+#   - create takes a lock on the base repo, so concurrent creates can't collide
+#     on a sequence number or an index.
+#   - diagnostics go to stderr and data to stdout, so `cd "$(wt path x)"`,
+#     `p=$(wt create x)` and `wt list --json | jq` all work.
+#   - `activate` points active_link at one worktree and runs pre_activate /
+#     post_activate around the switch, so a dev server can be restarted (or a
+#     reverse proxy reloaded) against the newly active tree.
+#
+set -euo pipefail
+
+# ---- helpers --------------------------------------------------------------
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 2 ]; then
+  c_red=''; c_grn=''; c_ylw=''; c_blu=''; c_rst=''
+else
+  c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_blu=$'\033[34m'; c_rst=$'\033[0m'
+fi
+# All diagnostics go to stderr; stdout is reserved for data (paths, JSON, tables).
+info()  { printf '%s==>%s %s\n' "$c_blu" "$c_rst" "$*" >&2; }
+ok()    { printf '%s✓%s %s\n'   "$c_grn" "$c_rst" "$*" >&2; }
+warn()  { printf '%s!%s %s\n'   "$c_ylw" "$c_rst" "$*" >&2; }
+die()   { printf '%s✗%s %s\n'   "$c_red" "$c_rst" "$*" >&2; exit 1; }
+
+git_base() { git -C "$BASE_REPO" "$@"; }
+
+# ---- config ---------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Locate the wt.yml config file.
+find_config() {
+  if [ -n "${WT_CONFIG:-}" ]; then
+    [ -f "$WT_CONFIG" ] || die "WT_CONFIG points to a missing file: $WT_CONFIG"
+    printf '%s' "$WT_CONFIG"; return
+  fi
+  if [ -f "$SCRIPT_DIR/wt.yml" ]; then
+    printf '%s' "$SCRIPT_DIR/wt.yml"; return
+  fi
+  local dir="$PWD"
+  while [ "$dir" != "/" ]; do
+    if [ -f "$dir/wt.yml" ]; then printf '%s' "$dir/wt.yml"; return; fi
+    dir="$(dirname "$dir")"
+  done
+  die "No wt.yml found. Create one next to the script: cp wt.yml.example wt.yml (then edit base_repo). Or set \$WT_CONFIG to an existing config."
+}
+
+# Read one flat "key: value" from the YAML file. Strips quotes and inline
+# comments. Prints the value (empty if the key is absent).
+yml_get() {
+  local key="$1" file="$2" line val
+  line="$(grep -E "^[[:space:]]*${key}[[:space:]]*:" "$file" | head -n1 || true)"
+  [ -n "$line" ] || return 0
+  val="${line#*:}"                              # drop "key:"
+  val="${val#"${val%%[![:space:]]*}"}"          # ltrim
+  if [[ "$val" == \"* ]]; then                  # "quoted"
+    val="${val#\"}"; val="${val%%\"*}"
+  elif [[ "$val" == \'* ]]; then                # 'quoted'
+    val="${val#\'}"; val="${val%%\'*}"
+  else
+    val="${val%%#*}"                            # strip inline comment
+    val="${val%"${val##*[![:space:]]}"}"        # rtrim
+  fi
+  printf '%s' "$val"
+}
+
+# Read a block-style YAML list ("key:" followed by indented "- item" lines).
+# Prints one item per line. Flow style ("key: [a, b]") is not supported.
+yml_list() {
+  local key="$1" file="$2"
+  awk -v key="$key" '
+    !inlist && $0 ~ "^[[:space:]]*"key"[[:space:]]*:" { inlist = 1; next }
+    inlist {
+      if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next   # blanks/comments
+      if ($0 !~ /^[[:space:]]*-[[:space:]]*/) { inlist = 0; next }
+      item = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", item)
+      sub(/[[:space:]]+#.*$/, "", item)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", item)
+      gsub(/^"|"$/, "", item); gsub(/^\047|\047$/, "", item)
+      if (item != "") print item
+    }
+  ' "$file"
+}
+
+# Read a value that may be a block scalar:
+#     post_create: pipenv install          -> inline, same as yml_get
+#     post_create: |                       -> literal block, newlines kept
+#       stop-server
+#       start-server
+#     post_create: >                       -> folded block, newlines become spaces
+# Chomping indicators (|- |+ >- >+) are accepted and treated as "-" (trailing
+# newlines stripped), which is what a shell command wants.
+yml_cmd() {
+  local key="$1" file="$2" val
+  val="$(yml_get "$key" "$file")"
+  case "$val" in
+    '|'|'|-'|'|+'|'>'|'>-'|'>+') ;;
+    *) printf '%s' "$val"; return ;;
+  esac
+  local fold=0
+  case "$val" in '>'*) fold=1 ;; esac
+  awk -v key="$key" -v fold="$fold" '
+    function indent(l,   i) { match(l, /^[[:space:]]*/); return RLENGTH }
+    !started && $0 ~ "^[[:space:]]*"key"[[:space:]]*:" { started = 1; keyind = indent($0); next }
+    started {
+      if ($0 ~ /^[[:space:]]*$/) { if (n > 0) blank = 1; next }
+      if (indent($0) <= keyind) exit
+      if (bodyind == 0) bodyind = indent($0)
+      line = substr($0, bodyind + 1)
+      if (blank) { body = body "\n"; blank = 0 }
+      if (n++ == 0) body = line
+      else if (fold) body = body " " line
+      else body = body "\n" line
+    }
+    END { printf "%s", body }
+  ' "$file"
+}
+
+# Resolve a path relative to the config file's directory (absolute stays as-is).
+resolve_path() {
+  local p="$1" base="$2"
+  case "$p" in
+    /*) printf '%s' "$p" ;;
+    *)  printf '%s' "$base/$p" ;;
+  esac
+}
+
+load_config() {
+  local cfg cfg_dir
+  cfg="$(find_config)"
+  cfg_dir="$(cd "$(dirname "$cfg")" && pwd)"
+  WT_CONFIG_FILE="$cfg"
+
+  # Each value: env var override > yml value > built-in default.
+  local base_repo root
+  base_repo="${WT_BASE_REPO:-$(yml_get base_repo "$cfg")}"
+  root="${WT_WORKTREE_ROOT:-$(yml_get worktree_root "$cfg")}"
+  MAIN_BRANCH="${WT_MAIN_BRANCH:-$(yml_get main_branch "$cfg")}"
+  REMOTE="${WT_REMOTE:-$(yml_get remote "$cfg")}"
+  DATE_FMT="${WT_DATE_FORMAT:-$(yml_get date_format "$cfg")}"
+  COMMIT_PREFIX="${WT_COMMIT_PREFIX:-$(yml_get commit_prefix "$cfg")}"
+  PORT_BASE_CFG="${WT_PORT_BASE_CFG:-$(yml_get port_base "$cfg")}"
+  PORT_STRIDE="${WT_PORT_STRIDE:-$(yml_get port_stride "$cfg")}"
+  POST_CREATE="${WT_POST_CREATE:-$(yml_cmd post_create "$cfg")}"
+  PRE_ACTIVATE="${WT_PRE_ACTIVATE:-$(yml_cmd pre_activate "$cfg")}"
+  POST_ACTIVATE="${WT_POST_ACTIVATE:-$(yml_cmd post_activate "$cfg")}"
+  local active_link
+  active_link="${WT_ACTIVE_LINK:-$(yml_get active_link "$cfg")}"
+  # dir_prefix may legitimately be set to "" to disable prefixing, so only fall
+  # back to the default when the key is absent from both the env and the yml.
+  if [ -n "${WT_DIR_PREFIX+set}" ]; then
+    DIR_PREFIX="$WT_DIR_PREFIX"
+  elif grep -qE '^[[:space:]]*dir_prefix[[:space:]]*:' "$cfg"; then
+    DIR_PREFIX="$(yml_get dir_prefix "$cfg")"
+  else
+    DIR_PREFIX="wt-"
+  fi
+  MANAGE_GITIGNORE="${WT_MANAGE_GITIGNORE:-$(yml_get manage_gitignore "$cfg")}"
+  : "${MANAGE_GITIGNORE:=true}"
+
+  # Lists: env overrides are space-separated, yml is a block list.
+  if [ -n "${WT_COPY+set}" ]; then
+    # shellcheck disable=SC2086  # deliberate split: WT_COPY is space-separated
+    COPY_LIST="$(printf '%s\n' ${WT_COPY})"
+  else
+    COPY_LIST="$(yml_list copy "$cfg")"
+  fi
+  if [ -n "${WT_LINK+set}" ]; then
+    # shellcheck disable=SC2086  # deliberate split: WT_LINK is space-separated
+    LINK_LIST="$(printf '%s\n' ${WT_LINK})"
+  else
+    LINK_LIST="$(yml_list link "$cfg")"
+  fi
+
+  [ -n "$base_repo" ] || die "wt.yml: 'base_repo' is required."
+  : "${root:=.}"
+  : "${MAIN_BRANCH:=main}"
+  : "${REMOTE:=origin}"
+  : "${DATE_FMT:=%d-%m-%Y}"
+  : "${COMMIT_PREFIX:=wip}"
+  : "${PORT_STRIDE:=10}"
+  case "$DIR_PREFIX" in
+    */*) die "dir_prefix must not contain '/': $DIR_PREFIX" ;;
+  esac
+  case "$MANAGE_GITIGNORE" in
+    true|yes|1)  MANAGE_GITIGNORE=1 ;;
+    false|no|0)  MANAGE_GITIGNORE=0 ;;
+    *) die "manage_gitignore must be true or false, got: $MANAGE_GITIGNORE" ;;
+  esac
+  if [ -n "$PORT_BASE_CFG" ]; then
+    case "$PORT_BASE_CFG" in
+      *[!0-9]*) die "port_base must be a number, got: $PORT_BASE_CFG" ;;
+    esac
+  fi
+  case "$PORT_STRIDE" in
+    *[!0-9]*|'') die "port_stride must be a number, got: $PORT_STRIDE" ;;
+  esac
+
+  base_repo="$(resolve_path "$base_repo" "$cfg_dir")"
+  [ -d "$base_repo" ] || die "base_repo does not exist: $base_repo"
+  BASE_REPO="$(cd "$base_repo" && pwd)"
+
+  root="$(resolve_path "$root" "$cfg_dir")"
+  mkdir -p "$root"
+  WT_ROOT="$(cd "$root" && pwd)"
+  WT_ROOT_PHYS="$(cd "$root" && pwd -P)"
+
+  ACTIVE_LINK=""
+  if [ -n "$active_link" ]; then
+    ACTIVE_LINK="$(resolve_path "$active_link" "$cfg_dir")"
+    local link_dir; link_dir="$(dirname "$ACTIVE_LINK")"
+    if [ -d "$link_dir" ]; then
+      ACTIVE_LINK="$(cd "$link_dir" && pwd)/$(basename "$ACTIVE_LINK")"
+    fi
+  fi
+}
+
+cmd_config() {
+  printf 'config file : %s\n' "$WT_CONFIG_FILE"
+  printf 'base_repo   : %s\n' "$BASE_REPO"
+  printf 'worktree_root: %s\n' "$WT_ROOT"
+  printf 'dir_prefix  : %s\n' "${DIR_PREFIX:-(none)}"
+  printf 'manage_gitignore: %s\n' "$( [ "$MANAGE_GITIGNORE" -eq 1 ] && echo true || echo false )"
+  printf 'gitignore   : %s\n' "$(gitignore_target || echo '(worktree_root is not in a git repo)')"
+  printf 'main_branch : %s\n' "$MAIN_BRANCH"
+  printf 'remote      : %s\n' "$REMOTE"
+  printf 'date_format : %s\n' "$DATE_FMT"
+  printf 'commit_prefix: %s\n' "$COMMIT_PREFIX"
+  printf 'port_base   : %s\n' "${PORT_BASE_CFG:-(disabled)}"
+  printf 'port_stride : %s\n' "$PORT_STRIDE"
+  printf 'post_create : %s\n' "${POST_CREATE:-(none)}"
+  printf 'active_link : %s\n' "${ACTIVE_LINK:-(disabled)}"
+  printf 'pre_activate: %s\n' "${PRE_ACTIVATE:-(none)}"
+  printf 'post_activate: %s\n' "${POST_ACTIVATE:-(none)}"
+  printf 'active      : %s\n' "$(active_name || echo '(none)')"
+  printf 'copy        : %s\n' "$(printf '%s' "$COPY_LIST" | tr '\n' ' ')"
+  printf 'link        : %s\n' "$(printf '%s' "$LINK_LIST" | tr '\n' ' ')"
+}
+
+# ---- locking --------------------------------------------------------------
+# Several agents may run `wt create` at once. mkdir is atomic everywhere, so it
+# serializes the part that allocates a sequence number, an index and a path.
+LOCK_DIR=""
+release_lock() {
+  if [ -n "$LOCK_DIR" ]; then rm -rf "$LOCK_DIR"; LOCK_DIR=""; fi
+  return 0
+}
+acquire_lock() {
+  local common waited=0 limit="${WT_LOCK_TIMEOUT:-60}"
+  common="$(git_base rev-parse --git-common-dir)"
+  case "$common" in /*) ;; *) common="$BASE_REPO/$common" ;; esac
+  local lock="$common/wt.lock"
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [ "$waited" -ge "$limit" ]; then
+      die "Timed out waiting for the wt lock. If no other wt is running, remove: $lock"
+    fi
+    if [ "$waited" -eq 2 ]; then info "Waiting for another wt to finish ..."; fi
+    sleep 1; waited=$((waited + 1))
+  done
+  LOCK_DIR="$lock"
+  # A bare `trap release_lock INT` would release the lock and then *resume* the
+  # script — dropping the lock in the middle of the critical section. The
+  # signal traps must exit as well.
+  trap release_lock EXIT
+  trap 'release_lock; exit 130' INT
+  trap 'release_lock; exit 143' TERM
+  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
+}
+
+# ---- per-worktree index ---------------------------------------------------
+# Each worktree gets a small stable integer, kept in the base repo's git config
+# (so it lives outside the worktree and survives everything but delete).
+INDEX_KEY='wt.worktree-index'
+
+index_get() {
+  git_base config --get-all "$INDEX_KEY" 2>/dev/null | awk -v n="$1" '$1 == n { print $2; exit }'
+}
+
+# Reserve the lowest free index for <name>. Call while holding the lock.
+index_alloc() {
+  local name="$1" existing n used
+  existing="$(index_get "$name")"
+  if [ -n "$existing" ]; then printf '%s' "$existing"; return; fi
+  used="$(git_base config --get-all "$INDEX_KEY" 2>/dev/null | awk '{ print $2 }')"
+  n=1
+  while printf '%s\n' "$used" | grep -qx "$n"; do n=$((n + 1)); done
+  git_base config --add "$INDEX_KEY" "$name $n"
+  printf '%s' "$n"
+}
+
+index_free() {
+  local name="$1" esc
+  # shellcheck disable=SC2016  # $ here is a regex metacharacter, not an expansion
+  esc="$(printf '%s' "$name" | sed 's/[][\.*^$(){}?+|/]/\\&/g')"
+  git_base config --unset-all "$INDEX_KEY" "^${esc} " 2>/dev/null || true
+}
+
+# The first port of a worktree's private range (empty when port_base is unset).
+port_base_for() {
+  local idx="$1"
+  [ -n "$PORT_BASE_CFG" ] || return 0
+  printf '%s' "$(( PORT_BASE_CFG + idx * PORT_STRIDE ))"
+}
+
+# ---- managed blocks -------------------------------------------------------
+# Replace the marked block in $file with the lines read from stdin (an empty
+# body removes the block); everything outside the markers is preserved.
+# mode "check" compares without writing. Returns 0 if the file changed / would
+# change, 1 if it is already correct.
+managed_block() {
+  local file="$1" begin="$2" end="$3" mode="${4:-write}" tmp body
+  body="$(cat)"
+  tmp="$(mktemp)"
+  if [ -f "$file" ]; then
+    awk -v b="$begin" -v e="$end" '
+      $0 == b { skip = 1; next }
+      $0 == e { skip = 0; next }
+      !skip   { lines[n++] = $0 }
+      END     { while (n > 0 && lines[n-1] == "") n--
+                for (i = 0; i < n; i++) print lines[i] }
+    ' "$file" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  if [ -n "$body" ]; then
+    # Blank line before the block, but only if something precedes it. Decided
+    # before the append starts, so nothing reads and writes $tmp at once.
+    local lead=""
+    if [ -s "$tmp" ]; then lead=$'\n'; fi
+    printf '%s%s\n%s\n%s\n' "$lead" "$begin" "$body" "$end" >> "$tmp"
+  fi
+  if [ -f "$file" ] && cmp -s "$tmp" "$file"; then rm -f "$tmp"; return 1; fi
+  if [ "$mode" = "check" ]; then rm -f "$tmp"; return 0; fi
+  mkdir -p "$(dirname "$file")"
+  cat "$tmp" > "$file"          # preserve the file's mode/ownership
+  rm -f "$tmp"
+  return 0
+}
+
+# ---- the active worktree --------------------------------------------------
+# "Active" means two things: active_link (a stable path that always points at
+# one worktree, so servers, editors and scripts have a fixed place to start
+# from) and a marker in the base repo's config. Flipping the link cannot move a
+# process that is already running — that is what pre_activate/post_activate are
+# for: stop and restart the server, or reload a reverse proxy onto the new tree.
+ACTIVE_KEY='wt.active'
+
+active_name() {
+  local n; n="$(git_base config --get "$ACTIVE_KEY" 2>/dev/null || true)"
+  [ -n "$n" ] || return 1
+  printf '%s' "$n"
+}
+
+active_clear() { git_base config --unset "$ACTIVE_KEY" 2>/dev/null || true; }
+
+# Repoint active_link at $1. Note `ln -sfn`, not `mv`: mv follows a symlink
+# that points at a directory and would move the new link *inside* the old
+# worktree. -n is "don't follow the target link" on both BSD and GNU ln.
+flip_active_link() {
+  local target="$1" now
+  [ -n "$ACTIVE_LINK" ] || return 0
+  if [ -e "$ACTIVE_LINK" ] && [ ! -L "$ACTIVE_LINK" ]; then
+    die "active_link exists and is not a symlink, refusing to replace it: $ACTIVE_LINK"
+  fi
+  mkdir -p "$(dirname "$ACTIVE_LINK")"
+  ln -sfn "$target" "$ACTIVE_LINK"
+  now="$(readlink "$ACTIVE_LINK" 2>/dev/null || true)"
+  [ "$now" = "$target" ] || die "Could not point $ACTIVE_LINK at $target (it is now: ${now:-not a symlink})"
+}
+
+cmd_activate() {
+  local name="" hook=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-hook) hook=0; shift ;;
+      -*) die "Unknown flag for activate: $1" ;;
+      *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$name"
+  local path; path="$(find_wt_path "$name")"
+  [ -d "$path" ] || die "No worktree at $path"
+  name="$(name_of_path "$path")"
+
+  local prev prev_path=""
+  prev="$(active_name || true)"
+  if [ -n "$prev" ]; then
+    prev_path="$(find_wt_path "$prev")"
+    [ -d "$prev_path" ] || prev_path=""
+  fi
+
+  # Both hooks run in the incoming worktree and can see the outgoing one, so
+  # pre_activate can stop the old server and prepare the new tree (migrations,
+  # deps) before post_activate brings a server back up.
+  local rc=0
+  if [ "$hook" -eq 1 ] && [ -n "$PRE_ACTIVATE" ]; then
+    info "Running pre_activate ..."
+    run_in_worktree "$name" "$path" \
+      env "WT_PREVIOUS_NAME=$prev" "WT_PREVIOUS_PATH=$prev_path" "WT_ACTIVE_LINK=$ACTIVE_LINK" \
+      bash -c "$PRE_ACTIVATE" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      die "pre_activate failed (exit $rc) — not switching. Fix it, or re-run with --no-hook."
+    fi
+  fi
+
+  flip_active_link "$path"
+  git_base config "$ACTIVE_KEY" "$name"
+  if [ -n "$ACTIVE_LINK" ]; then
+    ok "Active: $name  ($ACTIVE_LINK -> $path)"
+  else
+    ok "Active: $name  ($path)"
+  fi
+  sync_gitignore --quiet
+
+  if [ "$hook" -eq 1 ] && [ -n "$POST_ACTIVATE" ]; then
+    info "Running post_activate ..."
+    run_in_worktree "$name" "$path" \
+      env "WT_PREVIOUS_NAME=$prev" "WT_PREVIOUS_PATH=$prev_path" "WT_ACTIVE_LINK=$ACTIVE_LINK" \
+      bash -c "$POST_ACTIVATE" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      ok "post_activate finished."
+    else
+      warn "post_activate failed (exit $rc) — '$name' is active but its server may not be up."
+    fi
+  fi
+
+  printf '%s\n' "$path"
+  return "$rc"
+}
+
+cmd_active() {
+  local want_path=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --path) want_path=1; shift ;;
+      *) die "Unknown flag for active: $1" ;;
+    esac
+  done
+  local name; name="$(active_name)" || die "No active worktree. Set one with: wt activate <name>"
+  if [ "$want_path" -eq 1 ]; then
+    local path; path="$(find_wt_path "$name")"
+    [ -d "$path" ] || die "Active worktree '$name' no longer exists at $path"
+    printf '%s\n' "$path"
+  else
+    printf '%s\n' "$name"
+  fi
+}
+
+# ---- gitignore ------------------------------------------------------------
+# Worktree directories are all named <dir_prefix>*, so one glob covers them.
+# The rule is generated from dir_prefix and kept inside a marked block, so
+# changing dir_prefix in wt.yml rewrites the rule instead of leaving a stale one.
+GI_BEGIN='# >>> wt worktrees (managed by wt — edits below are overwritten) >>>'
+GI_END='# <<< wt worktrees <<<'
+
+# Print the .gitignore that governs worktree_root; non-zero if it isn't in a repo.
+gitignore_target() {
+  local top
+  top="$(git -C "$WT_ROOT" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  printf '%s/.gitignore' "$top"
+}
+
+# The ignore rule for the current dir_prefix, anchored at worktree_root's path
+# relative to the repo root (so it only ignores worktrees, not lookalikes elsewhere).
+gitignore_rule() {
+  local top rel
+  top="$(git -C "$WT_ROOT" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  rel="${WT_ROOT_PHYS#"$top"}"; rel="${rel#/}"
+  if [ -n "$rel" ]; then
+    printf '/%s/%s*/' "$rel" "$DIR_PREFIX"
+  else
+    printf '/%s*/' "$DIR_PREFIX"
+  fi
+}
+
+# The ignore rule for active_link, when it sits inside the same repo.
+active_link_rule() {
+  local top rel phys
+  [ -n "$ACTIVE_LINK" ] || return 1
+  top="$(git -C "$WT_ROOT" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  phys="$(cd "$(dirname "$ACTIVE_LINK")" 2>/dev/null && pwd -P)" || return 1
+  phys="$phys/$(basename "$ACTIVE_LINK")"
+  case "$phys" in "$top"/*) ;; *) return 1 ;; esac
+  rel="${phys#"$top"/}"
+  printf '/%s' "$rel"
+}
+
+# Rewrite the managed block in .gitignore to match dir_prefix. Idempotent.
+# --check reports what would change without writing; --quiet stays silent when
+# the file is already correct.
+sync_gitignore() {
+  local quiet=0 check=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --quiet) quiet=1; shift ;;
+      --check) check=1; shift ;;
+      *) die "Unknown flag for gitignore: $1" ;;
+    esac
+  done
+  local say=ok; [ "$check" -eq 1 ] && say=info
+
+  if [ "$MANAGE_GITIGNORE" -eq 0 ]; then
+    [ "$quiet" -eq 1 ] || warn "manage_gitignore is false — not touching .gitignore."
+    return 0
+  fi
+
+  local file
+  if ! file="$(gitignore_target)"; then
+    [ "$quiet" -eq 1 ] || warn "worktree_root is not inside a git repository — nothing to ignore."
+    return 0
+  fi
+
+  # An empty dir_prefix would generate "/*/", which ignores every directory in
+  # the repo. Drop the managed block instead.
+  local rule="" body=""
+  if [ -n "$DIR_PREFIX" ]; then
+    rule="$(gitignore_rule)"
+    body="# Generated from dir_prefix in wt.yml. Re-run: wt gitignore
+$rule"
+  fi
+  # active_link is a symlink wt maintains; ignore it alongside the worktrees.
+  local link_rule; link_rule="$(active_link_rule || true)"
+  if [ -n "$link_rule" ]; then
+    if [ -n "$body" ]; then body="$body
+$link_rule"; else body="# Generated from active_link in wt.yml. Re-run: wt gitignore
+$link_rule"; fi
+  fi
+
+  local mode=write; [ "$check" -eq 1 ] && mode=check
+  if ! printf '%s' "$body" | managed_block "$file" "$GI_BEGIN" "$GI_END" "$mode"; then
+    if [ "$quiet" -eq 0 ]; then
+      if [ -z "$rule" ]; then
+        warn "dir_prefix is empty — no worktree rule in $file."
+      else
+        $say "$file already ignores '$rule'."
+      fi
+    fi
+    return 0
+  fi
+
+  if [ "$check" -eq 1 ]; then
+    if [ -n "$rule" ]; then
+      warn "$file is out of date; run 'wt gitignore' to write: $rule"
+    else
+      warn "$file has a stale managed block; run 'wt gitignore' to remove it (dir_prefix is empty)."
+    fi
+    return 1
+  fi
+
+  if [ -n "$rule" ]; then
+    ok "Ignoring '$rule' in $file"
+  else
+    warn "dir_prefix is empty — removed the managed block from $file (worktrees are not ignored)."
+  fi
+}
+
+# ---- worktree paths and enumeration ---------------------------------------
+# The on-disk path for a worktree name: <root>/<dir_prefix><name>.
+wt_path() { printf '%s/%s%s' "$WT_ROOT" "$DIR_PREFIX" "$1"; }
+
+# Resolve an existing worktree, accepting either the bare name or the prefixed
+# directory name, and falling back to an unprefixed directory left over from
+# before dir_prefix existed.
+find_wt_path() {
+  local name="$1" path
+  path="$(wt_path "$name")"
+  [ -e "$path" ] && { printf '%s' "$path"; return; }
+  # The user may have typed the directory name (already prefixed).
+  if [ -n "$DIR_PREFIX" ] && [[ "$name" == "$DIR_PREFIX"* ]]; then
+    path="$WT_ROOT/$name"
+    [ -e "$path" ] && { printf '%s' "$path"; return; }
+  fi
+  # Legacy, unprefixed worktree directory.
+  path="$WT_ROOT/$name"
+  [ -e "$path" ] && { printf '%s' "$path"; return; }
+  printf '%s' "$(wt_path "$name")"   # doesn't exist; report the canonical path
+}
+
+# Every worktree under worktree_root, as "path<TAB>branch" lines.
+list_worktrees() {
+  git_base worktree list --porcelain | awk -v r1="$WT_ROOT/" -v r2="$WT_ROOT_PHYS/" '
+    /^worktree /  { p = substr($0, 10); next }
+    /^branch /    { b = substr($0, 8); sub("refs/heads/", "", b); emit(); next }
+    /^detached$/  { b = "(detached)"; emit(); next }
+    function emit() {
+      if (p != "" && (index(p, r1) == 1 || index(p, r2) == 1)) print p "\t" b
+      p = ""
+    }
+  '
+}
+
+# The bare name of a worktree directory (its path minus root and dir_prefix).
+name_of_path() {
+  local base; base="$(basename "$1")"
+  printf '%s' "${base#"$DIR_PREFIX"}"
+}
+
+require_name() { [ -n "${1:-}" ] || die "Missing <name>."; }
+
+# Turn arbitrary text into a lowercase dash-slug: "Add Search!" -> "add-search".
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+# Build a branch name in the DD-MM-YYYY-N-slug convention. N is the next unused
+# sequence number for today, based on existing branches and worktree dirs.
+generate_name() {
+  local slug today max n branch
+  slug="$(slugify "$1")"
+  [ -n "$slug" ] || die "Slug is empty after normalizing '$1'."
+  today="$(date "+$DATE_FMT")"
+  max=0
+  # Scan existing branches for today's prefix.
+  while IFS= read -r branch; do
+    if [[ "$branch" =~ ^${today}-([0-9]+)- ]]; then
+      n="${BASH_REMATCH[1]}"
+      (( n > max )) && max="$n"
+    fi
+  done < <(git_base for-each-ref --format='%(refname:short)' refs/heads)
+  # Also scan worktree dirs, in case a branch was already deleted. Both
+  # prefixed and legacy unprefixed directories count.
+  local d base
+  for d in "$WT_ROOT"/*; do
+    [ -e "$d" ] || continue
+    base="$(basename "$d")"
+    base="${base#"$DIR_PREFIX"}"        # no-op when dir_prefix is empty
+    if [[ "$base" =~ ^${today}-([0-9]+)- ]]; then
+      n="${BASH_REMATCH[1]}"
+      (( n > max )) && max="$n"
+    fi
+  done
+  printf '%s-%s-%s' "$today" "$((max + 1))" "$slug"
+}
+
+# ---- seeding new worktrees ------------------------------------------------
+# Resolve a copy:/link: entry to "source<TAB>destination".
+seed_paths() {
+  local entry="$1" path="$2" src dst
+  case "$entry" in
+    /*) src="$entry"; dst="$path/$(basename "$entry")" ;;
+    *)  src="$BASE_REPO/$entry"; dst="$path/$entry" ;;
+  esac
+  printf '%s\t%s' "$src" "$dst"
+}
+
+# Copy / symlink the ignored files a worktree needs to be usable (.env, .venv,
+# node_modules, .claude/settings.local.json ...). Never clobbers what git
+# checked out, and skips sources that don't exist yet.
+seed_worktree() {
+  local path="$1" entry src dst pair
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    pair="$(seed_paths "$entry" "$path")"; src="${pair%%$'\t'*}"; dst="${pair#*$'\t'}"
+    if [ ! -e "$src" ]; then warn "copy: skipping '$entry' (not in $BASE_REPO)"; continue; fi
+    if [ -e "$dst" ]; then continue; fi
+    mkdir -p "$(dirname "$dst")"
+    cp -R "$src" "$dst"
+    info "copied $entry"
+  done <<< "$COPY_LIST"
+
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    pair="$(seed_paths "$entry" "$path")"; src="${pair%%$'\t'*}"; dst="${pair#*$'\t'}"
+    if [ ! -e "$src" ]; then warn "link: skipping '$entry' (not in $BASE_REPO)"; continue; fi
+    if [ -e "$dst" ] || [ -L "$dst" ]; then continue; fi
+    mkdir -p "$(dirname "$dst")"
+    ln -s "$src" "$dst"
+    info "linked $entry -> $src"
+  done <<< "$LINK_LIST"
+}
+
+# Escape a value for a double-quoted shell/dotenv assignment, so a path or a
+# --raw name containing " $ ` or \ can't break (or silently truncate) the file.
+env_esc() { printf '%s' "$1" | sed -e 's/[\\"$`]/\\&/g'; }
+
+# Write the worktree's identity where both tooling and the agent can read it.
+write_wt_env() {
+  local path="$1" name="$2" idx="$3" port="$4"
+  {
+    printf '# Generated by wt. Per-worktree identity; safe to source or read as dotenv.\n'
+    printf 'WT_NAME="%s"\n'      "$(env_esc "$name")"
+    printf 'WT_INDEX="%s"\n'     "$(env_esc "$idx")"
+    printf 'WT_PORT_BASE="%s"\n' "$(env_esc "$port")"
+    printf 'WT_PATH="%s"\n'      "$(env_esc "$path")"
+    printf 'WT_BASE_REPO="%s"\n' "$(env_esc "$BASE_REPO")"
+  } > "$path/.wt.env"
+}
+
+# Keep .wt.env out of `git status`. Git has no per-worktree exclude file
+# (info/exclude always resolves to the shared one), so this is a small managed
+# block in the base repo's .git/info/exclude — local, never committed, and it
+# applies to the base repo and every worktree alike. copy:/link: entries are
+# listed too: they are already ignored in the base repo (that is why they need
+# seeding), but a linked directory arrives as a *symlink*, which a trailing-
+# slash pattern like ".venv/" no longer matches.
+EX_BEGIN='# >>> wt seeded files (managed by wt) >>>'
+EX_END='# <<< wt seeded files <<<'
+
+sync_local_exclude() {
+  local common file entry
+  common="$(git_base rev-parse --git-common-dir)"
+  case "$common" in /*) ;; *) common="$BASE_REPO/$common" ;; esac
+  file="$common/info/exclude"
+
+  {
+    printf '/.wt.env\n'
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      case "$entry" in /*) entry="$(basename "$entry")" ;; esac
+      printf '/%s\n' "$entry"
+    done <<< "$COPY_LIST"$'\n'"$LINK_LIST"
+  } | managed_block "$file" "$EX_BEGIN" "$EX_END" write || true
+}
+
+# The environment every hook / exec / each command receives.
+wt_env() {
+  local name="$1" path="$2" idx port
+  idx="$(index_get "$name")"; : "${idx:=}"
+  port="$(port_base_for "${idx:-0}")"
+  printf '%s\n' \
+    "WT_NAME=$name" "WT_BRANCH=$name" "WT_PATH=$path" \
+    "WT_INDEX=$idx" "WT_PORT_BASE=$port" \
+    "WT_BASE_REPO=$BASE_REPO" "WT_MAIN_BRANCH=$MAIN_BRANCH"
+}
+
+# Run a command inside a worktree with that environment set.
+run_in_worktree() {
+  local name="$1" path="$2"; shift 2
+  local -a envs=()
+  while IFS= read -r line; do [ -n "$line" ] && envs+=("$line"); done < <(wt_env "$name" "$path")
+  ( cd "$path" && env "${envs[@]}" "$@" )
+}
+
+run_post_create() {
+  local name="$1" path="$2" rc=0
+  [ -n "$POST_CREATE" ] || return 0
+  info "Running post_create ..."
+  run_in_worktree "$name" "$path" bash -c "$POST_CREATE" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "post_create finished."
+  else
+    warn "post_create failed (exit $rc) — the worktree exists but may be unprovisioned."
+  fi
+  return "$rc"
+}
+
+# Fetch origin and fast-forward the local main branch to origin/main.
+# Works even while main is checked out in the base repo, as long as it's clean.
+update_main() {
+  info "Fetching $REMOTE ..."
+  git_base fetch --prune "$REMOTE"
+
+  local current
+  current="$(git_base rev-parse --abbrev-ref HEAD)"
+
+  if [ "$current" = "$MAIN_BRANCH" ]; then
+    if [ -n "$(git_base status --porcelain)" ]; then
+      warn "Base repo working tree is dirty on $MAIN_BRANCH — skipping fast-forward."
+      return 0
+    fi
+    if git_base merge-base --is-ancestor "$REMOTE/$MAIN_BRANCH" "$MAIN_BRANCH"; then
+      ok "$MAIN_BRANCH already up to date."
+    else
+      if git_base merge --ff-only "$REMOTE/$MAIN_BRANCH" >&2; then
+        ok "$MAIN_BRANCH fast-forwarded to $REMOTE/$MAIN_BRANCH."
+      else
+        die "Cannot fast-forward $MAIN_BRANCH (diverged). Resolve manually in $BASE_REPO."
+      fi
+    fi
+  else
+    # main isn't checked out here; update the ref directly (only if it fast-forwards).
+    if git_base fetch "$REMOTE" "$MAIN_BRANCH:$MAIN_BRANCH" 2>/dev/null; then
+      ok "$MAIN_BRANCH updated to $REMOTE/$MAIN_BRANCH."
+    else
+      warn "Could not fast-forward local $MAIN_BRANCH (base repo is on '$current'); using $REMOTE/$MAIN_BRANCH directly."
+    fi
+  fi
+}
+
+# ---- commands -------------------------------------------------------------
+cmd_create() {
+  local input="" from="" raw=0 hook=1 activate=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from|-b) from="${2:-}"; shift 2 ;;
+      --from=*)  from="${1#*=}"; shift ;;
+      --raw)     raw=1; shift ;;
+      --no-hook) hook=0; shift ;;
+      --activate) activate=1; shift ;;
+      -*) die "Unknown flag for create: $1" ;;
+      *)  if [ -z "$input" ]; then input="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$input"
+
+  update_main
+
+  # Determine the base ref to branch off.
+  local base_ref
+  if [ -n "$from" ]; then
+    if git_base show-ref --verify --quiet "refs/remotes/$REMOTE/$from"; then
+      base_ref="$REMOTE/$from"
+    elif git_base show-ref --verify --quiet "refs/heads/$from"; then
+      base_ref="$from"
+    else
+      die "Base branch '$from' not found locally or on $REMOTE."
+    fi
+  else
+    base_ref="$REMOTE/$MAIN_BRANCH"
+  fi
+
+  # Everything from here to `worktree add` must be atomic across parallel runs.
+  acquire_lock
+
+  local name
+  if [ "$raw" -eq 1 ]; then
+    name="$input"
+  else
+    name="$(generate_name "$input")"
+  fi
+
+  local path; path="$(wt_path "$name")"
+  [ -e "$path" ] && die "Path already exists: $path"
+
+  info "Creating worktree '$name' from $base_ref ..."
+  if git_base show-ref --verify --quiet "refs/heads/$name"; then
+    # Branch already exists — check it out into the new worktree.
+    warn "Branch '$name' already exists; checking it out (ignoring --from)."
+    git_base worktree add "$path" "$name" >&2
+  else
+    # --no-track: don't set upstream to the base branch (e.g. origin/main), so
+    # the worktree isn't misreported as "tracking main" and `git pull` here
+    # doesn't pull main. First push should use `git push -u origin HEAD`.
+    git_base worktree add --no-track -b "$name" "$path" "$base_ref" >&2
+  fi
+
+  local idx port
+  idx="$(index_alloc "$name")"
+  port="$(port_base_for "$idx")"
+
+  release_lock
+
+  # Seeding can be slow (copying .venv / node_modules), so it runs unlocked.
+  seed_worktree "$path"
+  write_wt_env "$path" "$name" "$idx" "$port"
+  # ... but these two rewrite shared files (.git/info/exclude, .gitignore) with
+  # a read-modify-write, so a concurrent create could read one mid-truncate and
+  # drop the user's own lines. Take the lock again for that stretch.
+  acquire_lock
+  sync_local_exclude
+  sync_gitignore --quiet
+  release_lock
+
+  if [ -n "$port" ]; then
+    ok "Worktree ready: $path  (branch: $name, index: $idx, ports: $port-$((port + PORT_STRIDE - 1)))"
+  else
+    ok "Worktree ready: $path  (branch: $name, index: $idx)"
+  fi
+
+  local rc=0
+  if [ "$hook" -eq 1 ]; then run_post_create "$name" "$path" || rc=$?; fi
+  if [ "$activate" -eq 1 ]; then
+    local hook_arg=(); [ "$hook" -eq 0 ] && hook_arg=(--no-hook)
+    cmd_activate "$name" "${hook_arg[@]+"${hook_arg[@]}"}" >/dev/null || rc=$?
+  fi
+  printf '%s\n' "$path"          # stdout: the path, for scripting
+  return "$rc"
+}
+
+cmd_delete() {
+  local name="" force=0 keep_branch=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force|-f)     force=1; shift ;;
+      --keep-branch)  keep_branch=1; shift ;;
+      -*) die "Unknown flag for delete: $1" ;;
+      *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$name"
+  local path; path="$(find_wt_path "$name")"
+  if [ ! -d "$path" ]; then
+    # Drop any stale registration first, so a half-deleted worktree doesn't
+    # keep failing, then report the real problem instead of git's "not a
+    # working tree" / "has changes".
+    git_base worktree prune >&2
+    die "No worktree at $path"
+  fi
+
+  # Find the branch checked out in this worktree before removing it. Match on
+  # both the logical and the physical path: `git worktree list` reports the
+  # resolved path, while find_wt_path builds one from worktree_root, which may
+  # be reached through a symlink. Parse with substr, not $2 — a worktree path
+  # can contain spaces.
+  local branch="" path_phys
+  path_phys="$(cd "$path" && pwd -P)" || path_phys="$path"
+  branch="$(git_base worktree list --porcelain \
+            | awk -v p1="$path" -v p2="$path_phys" '
+                /^worktree / { w = substr($0, 10); next }
+                /^branch /   { if (w == p1 || w == p2) {
+                                 b = substr($0, 8); sub("refs/heads/", "", b)
+                                 print b; exit
+                               } }
+              ')"
+
+  info "Removing worktree $path ..."
+  if [ "$force" -eq 1 ]; then
+    git_base worktree remove --force "$path" >&2
+  else
+    git_base worktree remove "$path" >&2 \
+      || die "Could not remove $path (uncommitted changes?). Re-run with --force to discard them."
+  fi
+  ok "Worktree removed."
+  local gone_name; gone_name="$(name_of_path "$path")"
+  index_free "$gone_name"
+  if [ "$(active_name || true)" = "$gone_name" ]; then
+    active_clear
+    if [ -n "$ACTIVE_LINK" ] && [ -L "$ACTIVE_LINK" ] && [ ! -e "$ACTIVE_LINK" ]; then
+      rm -f "$ACTIVE_LINK"
+    fi
+    warn "'$gone_name' was the active worktree — nothing is active now."
+  fi
+
+  if [ -n "$branch" ] && [ "$branch" != "$MAIN_BRANCH" ] && [ "$keep_branch" -eq 0 ]; then
+    if git_base branch -d "$branch" >/dev/null 2>&1; then
+      ok "Branch '$branch' deleted."
+    else
+      warn "Branch '$branch' not fully merged; kept. Delete with: git -C $BASE_REPO branch -D $branch"
+    fi
+  fi
+  git_base worktree prune >&2
+}
+
+# Bulk-remove finished worktrees: branches merged into main (--merged) and/or
+# branches whose upstream has been deleted (--gone, i.e. squash-merged PRs).
+cmd_clean() {
+  local merged=0 gone=0 dry=0 yes=0 keep_branch=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --merged)      merged=1; shift ;;
+      --gone)        gone=1; shift ;;
+      --dry-run|-n)  dry=1; shift ;;
+      --yes|-y)      yes=1; shift ;;
+      --keep-branch) keep_branch=1; shift ;;
+      *) die "Unknown flag for clean: $1" ;;
+    esac
+  done
+  [ "$merged" -eq 1 ] || [ "$gone" -eq 1 ] \
+    || die "Say what to clean: --merged (merged into $MAIN_BRANCH), --gone (upstream deleted), or both."
+
+  update_main
+
+  local -a victims=() reasons=()
+  local skipped=0 line path branch reason
+  while IFS=$'\t' read -r path branch; do
+    [ -n "$path" ] || continue
+    [ "$branch" = "$MAIN_BRANCH" ] && continue
+    [ "$branch" = "(detached)" ] && continue
+    reason=""
+    if [ "$merged" -eq 1 ] && git_base merge-base --is-ancestor "$branch" "$REMOTE/$MAIN_BRANCH" 2>/dev/null; then
+      reason="merged into $MAIN_BRANCH"
+    fi
+    if [ -z "$reason" ] && [ "$gone" -eq 1 ]; then
+      case "$(git_base for-each-ref --format='%(upstream:track)' "refs/heads/$branch")" in
+        *gone*) reason="upstream gone" ;;
+      esac
+    fi
+    [ -n "$reason" ] || continue
+    if [ -n "$(git -C "$path" status --porcelain)" ]; then
+      warn "skipping '$branch' ($reason) — uncommitted changes in $path"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    victims+=("$path"); reasons+=("$reason")
+  done < <(list_worktrees)
+
+  if [ "${#victims[@]}" -eq 0 ]; then
+    if [ "$skipped" -gt 0 ]; then
+      info "Nothing to clean. ($skipped skipped as dirty)"
+    else
+      info "Nothing to clean."
+    fi
+    return 0
+  fi
+
+  local i
+  for i in "${!victims[@]}"; do
+    printf '%s\t%s\n' "$(name_of_path "${victims[$i]}")" "${reasons[$i]}"
+  done
+
+  if [ "$dry" -eq 1 ]; then
+    info "Dry run — nothing removed."
+    return 0
+  fi
+  if [ "$yes" -eq 0 ]; then
+    if [ ! -t 0 ]; then
+      die "Refusing to remove ${#victims[@]} worktree(s) without a terminal. Re-run with --yes (or --dry-run)."
+    fi
+    local answer
+    printf 'Remove %d worktree(s)? [y/N] ' "${#victims[@]}" >&2
+    read -r answer
+    case "$answer" in y|Y|yes|YES) ;; *) info "Aborted."; return 0 ;; esac
+  fi
+
+  local -a delete_args=()
+  [ "$keep_branch" -eq 1 ] && delete_args+=(--keep-branch)
+  for i in "${!victims[@]}"; do
+    cmd_delete "$(name_of_path "${victims[$i]}")" "${delete_args[@]+"${delete_args[@]}"}"
+  done
+  ok "Cleaned ${#victims[@]} worktree(s)."
+}
+
+cmd_rebase() {
+  local name="" onto=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --onto) onto="${2:-}"; shift 2 ;;
+      --onto=*) onto="${1#*=}"; shift ;;
+      -*) die "Unknown flag for rebase: $1" ;;
+      *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$name"
+  local path; path="$(find_wt_path "$name")"
+  [ -d "$path" ] || die "No worktree at $path"
+
+  update_main
+
+  local target
+  if [ -n "$onto" ]; then
+    if git_base show-ref --verify --quiet "refs/remotes/$REMOTE/$onto"; then
+      target="$REMOTE/$onto"
+    else
+      target="$onto"
+    fi
+  else
+    target="$REMOTE/$MAIN_BRANCH"
+  fi
+
+  if [ -n "$(git -C "$path" status --porcelain)" ]; then
+    die "Worktree '$name' has uncommitted changes. Commit or stash first."
+  fi
+
+  git -C "$path" rev-parse --verify --quiet "$target^{commit}" >/dev/null \
+    || die "Rebase target '$target' not found locally or on $REMOTE."
+
+  info "Rebasing '$name' onto $target ..."
+  if git -C "$path" rebase "$target" >&2; then
+    ok "Rebased '$name' onto $target."
+  else
+    warn "Rebase hit conflicts. Resolve in $path, then: git -C $path rebase --continue"
+    warn "Or abort with: git -C $path rebase --abort"
+    exit 1
+  fi
+}
+
+cmd_commit() {
+  local name="" msg="" push=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --push|-p) push=1; shift ;;
+      -m) msg="${2:-}"; shift 2 ;;
+      -*) die "Unknown flag for commit: $1" ;;
+      *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$name"
+  local path; path="$(find_wt_path "$name")"
+  [ -d "$path" ] || die "No worktree at $path"
+
+  if [ -z "$(git -C "$path" status --porcelain)" ]; then
+    warn "Nothing to commit in '$name' (working tree clean)."
+  else
+    # Generic default message if none supplied.
+    [ -n "$msg" ] || msg="$COMMIT_PREFIX: $(date '+%Y-%m-%d %H:%M')"
+    info "Committing all changes in '$name' ..."
+    git -C "$path" add -A
+    git -C "$path" commit -m "$msg" >&2
+    ok "Committed: $msg"
+  fi
+
+  if [ "$push" -eq 1 ]; then
+    info "Pushing '$name' to $REMOTE ..."
+    git -C "$path" push -u "$REMOTE" HEAD >&2
+    ok "Pushed."
+  fi
+}
+
+cmd_path() {
+  require_name "${1:-}"
+  local path; path="$(find_wt_path "$1")"
+  [ -d "$path" ] || die "No worktree at $path"
+  printf '%s\n' "$path"
+}
+
+cmd_exec() {
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      -*) die "Unknown flag for exec: $1" ;;
+      *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$name"
+  [ $# -gt 0 ] || die "Nothing to run. Usage: wt exec <name> -- <command> [args]"
+  local path; path="$(find_wt_path "$name")"
+  [ -d "$path" ] || die "No worktree at $path"
+  run_in_worktree "$(name_of_path "$path")" "$path" "$@"
+}
+
+cmd_each() {
+  local keep_going=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep-going|-k) keep_going=1; shift ;;
+      --) shift; break ;;
+      *) die "Unknown flag for each: $1 (usage: wt each [--keep-going] -- <command>)" ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "Nothing to run. Usage: wt each -- <command> [args]"
+
+  # The worktree list is read on fd 3, not stdin: a command that reads stdin
+  # (anything interactive, `cat`, `git` with a pager off a pipe ...) would
+  # otherwise swallow the remaining worktrees and silently skip them.
+  local path branch name rc=0 failed=0 count=0
+  while IFS=$'\t' read -r path branch <&3; do
+    [ -n "$path" ] || continue
+    name="$(name_of_path "$path")"
+    count=$((count + 1))
+    info "── $name"
+    rc=0
+    run_in_worktree "$name" "$path" "$@" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      failed=$((failed + 1))
+      warn "$name: exit $rc"
+      [ "$keep_going" -eq 1 ] || { warn "Stopping (pass --keep-going to continue)."; return "$rc"; }
+    fi
+  done 3< <(list_worktrees)
+
+  [ "$count" -gt 0 ] || { info "No worktrees under $WT_ROOT."; return 0; }
+  if [ "$failed" -gt 0 ]; then
+    warn "$failed of $count worktree(s) failed."
+    return 1
+  fi
+  ok "$count worktree(s) succeeded."
+}
+
+json_str() {
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n\r\t')"
+}
+
+# Gather status for one worktree: dirty, ahead/behind main, head, subject.
+wt_status() {   # path -> "dirty<TAB>ahead<TAB>behind<TAB>head<TAB>subject"
+  local path="$1" dirty=false counts behind=0 ahead=0 head subject
+  [ -n "$(git -C "$path" status --porcelain)" ] && dirty=true
+  if counts="$(git -C "$path" rev-list --left-right --count "$REMOTE/$MAIN_BRANCH...HEAD" 2>/dev/null)"; then
+    behind="$(printf '%s' "$counts" | awk '{print $1}')"
+    ahead="$(printf '%s' "$counts" | awk '{print $2}')"
+  fi
+  head="$(git -C "$path" rev-parse --short HEAD 2>/dev/null || printf '-')"
+  subject="$(git -C "$path" log -1 --pretty=%s 2>/dev/null || printf '')"
+  printf '%s\t%s\t%s\t%s\t%s' "$dirty" "$ahead" "$behind" "$head" "$subject"
+}
+
+cmd_list() {
+  local json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      *) die "Unknown flag for list: $1" ;;
+    esac
+  done
+
+  local path branch name idx port st dirty ahead behind head subject first=1 act mark
+  [ "$json" -eq 1 ] && printf '[\n'
+  act="$(active_name || true)"
+  [ "$json" -eq 0 ] && printf '%-2s %-32s %4s %7s %-6s %7s  %s\n' '' NAME IDX PORTS DIRTY AHEAD/B HEAD
+
+  while IFS=$'\t' read -r path branch; do
+    [ -n "$path" ] || continue
+    name="$(name_of_path "$path")"
+    idx="$(index_get "$name")"
+    port="$(port_base_for "${idx:-0}")"
+    [ -n "$idx" ] || port=""
+    st="$(wt_status "$path")"
+    if [ "$name" = "$act" ]; then mark='*'; else mark=''; fi
+    IFS=$'\t' read -r dirty ahead behind head subject <<< "$st"
+    if [ "$json" -eq 1 ]; then
+      [ "$first" -eq 1 ] || printf ',\n'
+      first=0
+      printf '  {"name": %s, "path": %s, "branch": %s, "index": %s, "port_base": %s, "active": %s, "dirty": %s, "ahead": %s, "behind": %s, "head": %s, "subject": %s}' \
+        "$(json_str "$name")" "$(json_str "$path")" "$(json_str "$branch")" \
+        "${idx:-null}" "${port:-null}" "$( [ -n "$mark" ] && echo true || echo false )" \
+        "$dirty" "$ahead" "$behind" \
+        "$(json_str "$head")" "$(json_str "$subject")"
+    else
+      printf '%-2s %-32s %4s %7s %-6s %3s/%-3s  %s\n' \
+        "$mark" "$name" "${idx:--}" "${port:--}" "$dirty" "$ahead" "$behind" "$head"
+    fi
+  done < <(list_worktrees)
+
+  [ "$json" -eq 1 ] && printf '\n]\n'
+  return 0
+}
+
+usage() {
+  # Print the header comment block (everything after the shebang, up to the
+  # first non-comment line).
+  awk 'NR>2 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+}
+
+# ---- dispatch -------------------------------------------------------------
+cmd="${1:-}"; shift || true
+
+# help/usage doesn't need a config file.
+case "$cmd" in
+  ""|help|-h|--help) usage; exit 0 ;;
+esac
+
+load_config
+git_base rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || die "base_repo is not a git repository: $BASE_REPO"
+
+case "$cmd" in
+  create) cmd_create "$@" ;;
+  delete|rm|remove) cmd_delete "$@" ;;
+  clean) cmd_clean "$@" ;;
+  rebase) cmd_rebase "$@" ;;
+  commit) cmd_commit "$@" ;;
+  exec) cmd_exec "$@" ;;
+  each) cmd_each "$@" ;;
+  path) cmd_path "$@" ;;
+  activate|use) cmd_activate "$@" ;;
+  active) cmd_active "$@" ;;
+  update|update-main) update_main ;;
+  list|ls) cmd_list "$@" ;;
+  gitignore) sync_gitignore "$@" ;;
+  config) cmd_config ;;
+  *) die "Unknown command: $cmd (try: wt help)" ;;
+esac

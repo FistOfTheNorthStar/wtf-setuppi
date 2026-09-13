@@ -1,0 +1,3 @@
+# Resolve `. "$DIR/helpers.sh"` relative to the sourcing script.
+source-path=SCRIPTDIR
+external-sources=true

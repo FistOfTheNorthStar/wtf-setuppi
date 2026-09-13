@@ -1,0 +1,64 @@
+# wt configuration — copy to wt.yml and edit for your repo.
+#
+# Paths (base_repo, worktree_root) are resolved relative to THIS file
+# unless they are absolute. Every key can also be overridden at runtime by
+# the matching WT_* environment variable (e.g. WT_MAIN_BRANCH=master).
+#
+# The script looks for config in this order:
+#   1. $WT_CONFIG                 explicit path to a wt.yml
+#   2. wt.yml next to the script
+#   3. wt.yml in $PWD, walking up parent directories
+
+base_repo: ../my-repo          # WT_BASE_REPO      — the main repo, kept on latest main
+worktree_root: .               # WT_WORKTREE_ROOT  — where worktrees are created
+dir_prefix: "wt-"              # WT_DIR_PREFIX     — prefix for worktree DIRECTORIES (gitignore "wt-*/")
+manage_gitignore: true         # WT_MANAGE_GITIGNORE — let wt maintain that .gitignore rule
+main_branch: main              # WT_MAIN_BRANCH    — base branch, always pulled to latest
+remote: origin                 # WT_REMOTE         — git remote to fetch/push
+date_format: "%d-%m-%Y"        # WT_DATE_FORMAT    — date prefix for auto-named branches (strftime)
+commit_prefix: wip             # WT_COMMIT_PREFIX  — default `wt commit` message prefix
+
+# ---- the active worktree --------------------------------------------------
+
+# A stable path that always points at the active worktree, so a dev server,
+# an editor or a script can start from one place. Resolved like base_repo;
+# leave empty to disable. wt keeps it out of git for you.
+active_link:                   # WT_ACTIVE_LINK    — e.g. ./current
+
+# `wt activate <name>` runs pre_activate, repoints active_link, then runs
+# post_activate. Both run INSIDE the incoming worktree and additionally get
+# WT_PREVIOUS_NAME, WT_PREVIOUS_PATH and WT_ACTIVE_LINK, so pre_activate can
+# stop the outgoing server and prepare the new tree before post_activate brings
+# a server back up. A failing pre_activate aborts the switch.
+#
+# Flipping a symlink cannot move a process that is already running, so one of
+# these hooks has to restart the server — or reload a reverse proxy onto the
+# newly active tree.
+pre_activate:                  # WT_PRE_ACTIVATE   — e.g. stop the server, run migrations
+post_activate:                 # WT_POST_ACTIVATE  — e.g. start the server again
+
+# ---- running several worktrees (or agents) at once ------------------------
+
+# Each worktree gets a stable index (1, 2, 3 ...). With port_base set it also
+# gets a private port range: WT_PORT_BASE = port_base + index * port_stride.
+# Leave port_base empty to disable. Both land in the worktree's .wt.env and in
+# the environment of post_create / exec / each.
+port_base:                     # WT_PORT_BASE_CFG  — e.g. 8000 -> worktree 3 gets 8030
+port_stride: 10                # WT_PORT_STRIDE    — ports reserved per worktree
+
+# Run inside the new worktree after it is created. Gets WT_NAME, WT_BRANCH,
+# WT_PATH, WT_INDEX, WT_PORT_BASE, WT_BASE_REPO, WT_MAIN_BRANCH.
+post_create:                   # WT_POST_CREATE    — e.g. 'pipenv install --dev'
+
+# Seconds `create` waits for a concurrent wt to finish before giving up.
+# Env-only (WT_LOCK_TIMEOUT); the default of 60 is right for almost everyone.
+
+# Ignored files a fresh worktree needs to be usable. Sources are relative to
+# base_repo; missing ones are skipped with a warning, and nothing that git
+# checked out is ever overwritten.
+copy:                          # WT_COPY (space-separated) — per-worktree copies
+  # - .env
+  # - .claude/settings.local.json
+link:                          # WT_LINK (space-separated) — shared symlinks
+  # - .venv
+  # - node_modules
