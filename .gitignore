@@ -1,7 +1,12 @@
 # Local config — copy wt.yml.example to wt.yml and fill it in per checkout.
 wt.yml
 
+# Dev server log and pid written by post_activate (see wt.yml).
+server.log
+server.pid
+
 # >>> wt worktrees (managed by wt — edits below are overwritten) >>>
 # Generated from dir_prefix in wt.yml. Re-run: wt gitignore
 /wt-*/
+/current
 # <<< wt worktrees <<<
