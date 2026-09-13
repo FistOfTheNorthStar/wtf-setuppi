@@ -525,7 +525,9 @@ ends that test) against its own throwaway git repos under `$TMPDIR`: a bare
 "remote", a "base" clone, and a "host" directory holding `wt.yml`. Nothing
 touches the repo you are working in, `git` runs with `GIT_CONFIG_GLOBAL` and
 `GIT_CONFIG_SYSTEM` pointed at `/dev/null`, and every `WT_*` variable is unset
-first, so your shell environment can't change the result. Because tests share
+first, so your shell environment can't change the result. The suite also runs a
+*copy* of `wt` from that temp directory, so the real `wt.yml` next to the script
+is never picked up (the script prefers that file over the one in `$PWD`). Because tests share
 nothing, the runner runs one per CPU by default.
 
 ### Writing one
