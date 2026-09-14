@@ -53,6 +53,14 @@ tmpdir_root="${TMPDIR:-/tmp}"; tmpdir_root="${tmpdir_root%/}"
 WORK="$(mktemp -d "$tmpdir_root/wt-suite.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+# Run a COPY of the script from inside $WORK. wt prefers the wt.yml next to
+# itself over the one in $PWD, so once a checkout is set up (a real wt.yml
+# beside ./wt) the tests would otherwise point at the real base repo and
+# create/delete worktrees there instead of in their fixtures.
+mkdir -p "$WORK/bin"
+cp "$WT_BIN" "$WORK/bin/wt" && chmod +x "$WORK/bin/wt"
+export WT_BIN="$WORK/bin/wt"
+
 # One template fixture, copied per test (a git init/clone/commit per test was
 # pure overhead). See helpers.sh.
 export FIXTURE_TEMPLATE="$WORK/template"
