@@ -1,6 +1,10 @@
 # Local config — copy wt.yml.example to wt.yml and fill it in per checkout.
 wt.yml
 
+# Per-install skill links into the managed repo, e.g.
+# .claude/skills/worktree -> ../../wt-master/.claude/skills/worktree
+/.claude/skills/
+
 # Dev server log and pid written by post_activate (see wt.yml).
 server.log
 server.pid
