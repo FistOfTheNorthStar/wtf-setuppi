@@ -135,10 +135,10 @@ Run from inside `wt-shallowflaws/`:
 | `./wt commit <name>` | Stage **all** changes in the worktree and commit with a generic message (`wip: DD-MM-YYYY HH:MM`). |
 | `./wt commit <name> -m "msg"` | Same, but with your own commit message. |
 | `./wt commit <name> --push` | Commit, then `git push -u origin HEAD` (creates the remote branch on first push). |
-| `./wt delete <name>` | Remove the worktree and delete its branch (only if fully merged). |
+| `./wt delete <name>` | Remove the worktree and delete its branch (only if it is contained in `origin/main`). |
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
-| `./wt clean --merged` | Remove every worktree whose branch is merged into `main` (asks first). |
+| `./wt clean --merged` | Remove every worktree whose branch is contained in `main`, however it was merged (asks first). |
 | `./wt clean --gone` | Same, for branches whose remote was deleted — catches squash-merged PRs. |
 | `./wt clean --merged --dry-run` | List what would be removed. Add `--yes` to skip the prompt. |
 | `./wt activate <name>` | Make it the active worktree: run `pre_activate`, repoint `active_link`, run `post_activate`. |
@@ -339,8 +339,11 @@ Agent workflows generate a lot of dead worktrees:
 ./wt clean --merged --gone --yes       # remove it
 ```
 
-`--merged` catches branches merged into `main`; `--gone` catches branches whose
-remote was deleted, which is how a squash-merged PR looks locally. Worktrees
+`--merged` catches branches contained in `origin/main`: merged with a merge
+commit, or rebased or squashed so that merging them again would change nothing
+(the last two need git 2.38+). `--gone` catches branches whose remote was
+deleted. `delete` uses the same check to decide whether the branch can go too;
+a branch with changes that aren't on `main` is always kept. Worktrees
 with uncommitted changes are always skipped and reported. On a terminal `clean`
 lists what it will remove and asks for confirmation; with no terminal (a script,
 CI, an agent) it refuses to proceed unless you pass `--yes`.

@@ -294,6 +294,17 @@ is_permanent() {
   printf '%s\n' "$PERMANENT_LIST" | grep -qxF -- "$1"
 }
 
+# Whether everything on <branch> is already in <remote>/<main>: either it is an
+# ancestor (merge commit, fast-forward) or merging it would change nothing
+# (rebased or squash-merged). Needs git >= 2.38 for the second check; older git
+# only gets the first.
+contained_in_main() {
+  local b="$1" target="$REMOTE/$MAIN_BRANCH" tree
+  git_base merge-base --is-ancestor "$b" "$target" 2>/dev/null && return 0
+  tree="$(git_base merge-tree --write-tree "$target" "$b" 2>/dev/null | head -n1)" || return 1
+  [ -n "$tree" ] && [ "$tree" = "$(git_base rev-parse "$target^{tree}" 2>/dev/null)" ]
+}
+
 # Where a branch is checked out (base repo or a worktree); empty if nowhere.
 branch_checkout_path() {
   git_base worktree list --porcelain | awk -v b="refs/heads/$1" '
@@ -1015,7 +1026,13 @@ cmd_delete() {
   fi
 
   if [ -n "$branch" ] && [ "$branch" != "$MAIN_BRANCH" ] && [ "$keep_branch" -eq 0 ]; then
-    if git_base branch -d "$branch" >/dev/null 2>&1; then
+    # `branch -d` only knows ancestry against HEAD or the upstream, so it keeps
+    # rebased and squash-merged branches (and everything, once the base repo is
+    # detached). Check against main ourselves first.
+    if contained_in_main "$branch"; then
+      git_base branch -D "$branch" >/dev/null
+      ok "Branch '$branch' deleted (contained in $REMOTE/$MAIN_BRANCH)."
+    elif git_base branch -d "$branch" >/dev/null 2>&1; then
       ok "Branch '$branch' deleted."
     else
       warn "Branch '$branch' not fully merged; kept. Delete with: git -C $BASE_REPO branch -D $branch"
@@ -1050,7 +1067,7 @@ cmd_clean() {
     is_permanent "$branch" && continue
     [ "$branch" = "(detached)" ] && continue
     reason=""
-    if [ "$merged" -eq 1 ] && git_base merge-base --is-ancestor "$branch" "$REMOTE/$MAIN_BRANCH" 2>/dev/null; then
+    if [ "$merged" -eq 1 ] && contained_in_main "$branch"; then
       reason="merged into $MAIN_BRANCH"
     fi
     if [ -z "$reason" ] && [ "$gone" -eq 1 ]; then
