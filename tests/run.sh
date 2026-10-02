@@ -74,16 +74,23 @@ run_test() {
   local tmp log
   tmp="$(mktemp -d "$tmpdir_root/wt-test.XXXXXX")"
   log="$WORK/$slot.log"
-  if (
-      set -e
-      export TEST_TMP="$tmp"
-      # shellcheck source=helpers.sh
-      . "$DIR/helpers.sh"
-      # shellcheck source=/dev/null
-      . "$file"
-      fixture
-      "$fn"
-     ) >"$log" 2>&1 </dev/null; then
+  # A plain statement, not `if ( ... )` or `( ... ) || rc=$?`: bash ignores
+  # set -e inside an if condition or on the left of || / &&, so a failing
+  # assertion mid-test would not stop it and only its last command would
+  # decide the verdict. run.sh itself has no set -e, so this can't abort it.
+  local rc
+  (
+    set -e
+    export TEST_TMP="$tmp"
+    # shellcheck source=helpers.sh
+    . "$DIR/helpers.sh"
+    # shellcheck source=/dev/null
+    . "$file"
+    fixture
+    "$fn"
+  ) >"$log" 2>&1 </dev/null
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
     printf 'ok %s\n' "$name" > "$WORK/$slot.result"
   else
     printf 'fail %s\n' "$name" > "$WORK/$slot.result"
