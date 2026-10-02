@@ -23,7 +23,8 @@
 #   wt activate <name>                   make <name> the active worktree
 #   wt active [--path]                   print the active worktree
 #   wt path <name>                       print a worktree's path
-#   wt update                            fetch remote and fast-forward main in the base repo
+#   wt update                            fetch remote and fast-forward main and the
+#                                        permanent branches wherever they are checked out
 #   wt list [--json]                     list worktrees with status
 #   wt gitignore [--check]               sync the .gitignore rule for dir_prefix
 #   wt config                            show the resolved configuration
@@ -213,6 +214,12 @@ load_config() {
   else
     LINK_LIST="$(yml_list link "$cfg")"
   fi
+  if [ -n "${WT_PERMANENT+set}" ]; then
+    # shellcheck disable=SC2086  # deliberate split: WT_PERMANENT is space-separated
+    PERMANENT_LIST="$(printf '%s\n' ${WT_PERMANENT})"
+  else
+    PERMANENT_LIST="$(yml_list permanent "$cfg")"
+  fi
 
   [ -n "$base_repo" ] || die "wt.yml: 'base_repo' is required."
   : "${root:=.}"
@@ -277,6 +284,22 @@ cmd_config() {
   printf 'active      : %s\n' "$(active_name || echo '(none)')"
   printf 'copy        : %s\n' "$(printf '%s' "$COPY_LIST" | tr '\n' ' ')"
   printf 'link        : %s\n' "$(printf '%s' "$LINK_LIST" | tr '\n' ' ')"
+  printf 'permanent   : %s\n' "$(printf '%s' "$PERMANENT_LIST" | tr '\n' ' ')"
+}
+
+# Permanent branches (main_branch plus the `permanent:` list) are long-lived:
+# `update` keeps them fast-forwarded, and delete / clean never remove them.
+is_permanent() {
+  [ "$1" = "$MAIN_BRANCH" ] && return 0
+  printf '%s\n' "$PERMANENT_LIST" | grep -qxF -- "$1"
+}
+
+# Where a branch is checked out (base repo or a worktree); empty if nowhere.
+branch_checkout_path() {
+  git_base worktree list --porcelain | awk -v b="refs/heads/$1" '
+    /^worktree / { p = substr($0, 10); next }
+    /^branch /   { if (substr($0, 8) == b) { print p; exit } }
+  '
 }
 
 # ---- locking --------------------------------------------------------------
@@ -786,36 +809,53 @@ run_post_create() {
   return "$rc"
 }
 
-# Fetch origin and fast-forward the local main branch to origin/main.
-# Works even while main is checked out in the base repo, as long as it's clean.
+# Fetch origin and fast-forward main and every permanent branch to their
+# remote counterparts. A branch checked out somewhere (the base repo or a
+# worktree) is fast-forwarded in place, as long as that checkout is clean.
 update_main() {
   info "Fetching $REMOTE ..."
   git_base fetch --prune "$REMOTE"
 
-  local current
-  current="$(git_base rev-parse --abbrev-ref HEAD)"
+  ff_branch "$MAIN_BRANCH" 1
+  local b
+  while IFS= read -r b; do
+    [ -n "$b" ] && [ "$b" != "$MAIN_BRANCH" ] && ff_branch "$b" 0
+  done <<< "$PERMANENT_LIST"
+  return 0
+}
 
-  if [ "$current" = "$MAIN_BRANCH" ]; then
-    if [ -n "$(git_base status --porcelain)" ]; then
-      warn "Base repo working tree is dirty on $MAIN_BRANCH — skipping fast-forward."
-      return 0
-    fi
-    if git_base merge-base --is-ancestor "$REMOTE/$MAIN_BRANCH" "$MAIN_BRANCH"; then
-      ok "$MAIN_BRANCH already up to date."
+# Fast-forward local <branch> to <remote>/<branch>. A diverged main is fatal
+# (strict=1); a diverged permanent branch only warns.
+ff_branch() {
+  local b="$1" strict="$2" path
+  if ! git_base show-ref --verify --quiet "refs/remotes/$REMOTE/$b"; then
+    warn "$REMOTE/$b does not exist — skipping fast-forward of $b."
+    return 0
+  fi
+  path="$(branch_checkout_path "$b")"
+
+  if [ -z "$path" ]; then
+    # Not checked out anywhere; update the ref directly (only if it fast-forwards).
+    if git_base fetch "$REMOTE" "$b:$b" 2>/dev/null; then
+      ok "$b updated to $REMOTE/$b."
     else
-      if git_base merge --ff-only "$REMOTE/$MAIN_BRANCH" >&2; then
-        ok "$MAIN_BRANCH fast-forwarded to $REMOTE/$MAIN_BRANCH."
-      else
-        die "Cannot fast-forward $MAIN_BRANCH (diverged). Resolve manually in $BASE_REPO."
-      fi
+      warn "Could not fast-forward local $b; using $REMOTE/$b directly."
     fi
+    return 0
+  fi
+
+  if [ -n "$(git -C "$path" status --porcelain)" ]; then
+    warn "$path is dirty on $b — skipping fast-forward."
+    return 0
+  fi
+  if git -C "$path" merge-base --is-ancestor "$REMOTE/$b" "$b"; then
+    ok "$b already up to date."
+  elif git -C "$path" merge --ff-only "$REMOTE/$b" >&2; then
+    ok "$b fast-forwarded to $REMOTE/$b."
+  elif [ "$strict" -eq 1 ]; then
+    die "Cannot fast-forward $b (diverged). Resolve manually in $path."
   else
-    # main isn't checked out here; update the ref directly (only if it fast-forwards).
-    if git_base fetch "$REMOTE" "$MAIN_BRANCH:$MAIN_BRANCH" 2>/dev/null; then
-      ok "$MAIN_BRANCH updated to $REMOTE/$MAIN_BRANCH."
-    else
-      warn "Could not fast-forward local $MAIN_BRANCH (base repo is on '$current'); using $REMOTE/$MAIN_BRANCH directly."
-    fi
+    warn "Cannot fast-forward $b (diverged from $REMOTE/$b). Resolve manually in $path."
   fi
 }
 
@@ -867,6 +907,13 @@ cmd_create() {
   info "Creating worktree '$name' from $base_ref ..."
   if git_base show-ref --verify --quiet "refs/heads/$name"; then
     # Branch already exists — check it out into the new worktree.
+    local elsewhere; elsewhere="$(branch_checkout_path "$name")"
+    if [ -n "$elsewhere" ]; then
+      if [ "$elsewhere" -ef "$BASE_REPO" ]; then
+        die "'$name' is checked out in the base repo. To give it its own worktree, detach the base first: git -C $BASE_REPO switch --detach"
+      fi
+      die "'$name' is already checked out in $elsewhere."
+    fi
     warn "Branch '$name' already exists; checking it out (ignoring --from)."
     git_base worktree add "$path" "$name" >&2
   else
@@ -945,6 +992,10 @@ cmd_delete() {
                                } }
               ')"
 
+  if [ -n "$branch" ] && is_permanent "$branch"; then
+    die "'$branch' is a permanent worktree. Remove it from 'permanent:' in $WT_CONFIG_FILE first, or use: git -C $BASE_REPO worktree remove $path"
+  fi
+
   info "Removing worktree $path ..."
   if [ "$force" -eq 1 ]; then
     git_base worktree remove --force "$path" >&2
@@ -996,7 +1047,7 @@ cmd_clean() {
   local skipped=0 line path branch reason
   while IFS=$'\t' read -r path branch; do
     [ -n "$path" ] || continue
-    [ "$branch" = "$MAIN_BRANCH" ] && continue
+    is_permanent "$branch" && continue
     [ "$branch" = "(detached)" ] && continue
     reason=""
     if [ "$merged" -eq 1 ] && git_base merge-base --is-ancestor "$branch" "$REMOTE/$MAIN_BRANCH" 2>/dev/null; then

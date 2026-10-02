@@ -62,3 +62,9 @@ copy:                          # WT_COPY (space-separated) — per-worktree copi
 link:                          # WT_LINK (space-separated) — shared symlinks
   # - .venv
   # - node_modules
+
+# Long-lived branches (main_branch is always one). Create each once with
+# `wt create <branch> --raw`; after that `clean` and `delete` leave it alone and
+# create / rebase / clean / update keep it fast-forwarded to <remote>/<branch>.
+permanent:                     # WT_PERMANENT (space-separated)
+  # - production
