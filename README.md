@@ -47,6 +47,7 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `remote` | The remote to fetch/push, if it isn't `origin` | `origin` |
 | `date_format` | `strftime` format for the date in auto-named branches | `%d-%m-%Y` |
 | `commit_prefix` | Prefix for `wt commit`'s default message | `wip` |
+| `remote_branch` | Name of the pushed branch once it has an issue number — see [Issue numbers](#issue-numbers) | `"#{issue}-{slug}"` |
 | `copy` / `link` | Ignored files each worktree needs (`.env`, `.venv`) — see [Parallel worktrees](#parallel-worktrees-and-agents) | — |
 | `port_base` / `port_stride` | Give each worktree its own port range | off / `10` |
 | `post_create` | Command to run in a freshly created worktree | — |
@@ -83,6 +84,7 @@ main_branch: main              # base branch, always pulled to latest
 remote: origin                 # git remote to fetch/push
 date_format: "%d-%m-%Y"        # date prefix for auto-named branches (strftime)
 commit_prefix: wip             # default `wt commit` message prefix
+remote_branch: "#{issue}-{slug}"   # branch name on the remote, given an issue number
 
 port_base: 8000                # worktree N gets ports 8000 + N*port_stride
 port_stride: 10
@@ -98,7 +100,7 @@ permanent:                     # long-lived branches, see "Permanent worktrees"
 
 Every key can also be overridden per-run by its matching env var:
 `WT_BASE_REPO`, `WT_WORKTREE_ROOT`, `WT_DIR_PREFIX`, `WT_MANAGE_GITIGNORE`,
-`WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_DATE_FORMAT`, `WT_COMMIT_PREFIX`,
+`WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_REMOTE_BRANCH`, `WT_DATE_FORMAT`, `WT_COMMIT_PREFIX`,
 `WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_ACTIVE_LINK`,
 `WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK` /
 `WT_PERMANENT` (space-separated). Run `./wt config` to print the resolved settings.
@@ -130,11 +132,14 @@ Run from inside `wt-shallowflaws/`:
 | `./wt create <slug>` | Fetch origin, fast-forward `main`, then create a worktree in **`wt-DD-MM-YYYY-N-<slug>/`** on a new branch **`DD-MM-YYYY-N-<slug>`** off **latest main**. |
 | `./wt create <slug> --from <branch>` | Same, but branch off `<branch>` (local or `origin/<branch>`) instead of `main`. |
 | `./wt create <name> --raw` | Skip auto-naming and use `<name>` verbatim as the branch/worktree name. |
+| `./wt create <slug> --issue 12345` | Same as `create`, and remember the issue: the branch is pushed as **`#12345-<slug>`**. |
 | `./wt rebase <name>` | Update `main`, then rebase the worktree's branch onto **latest `origin/main`**. |
 | `./wt rebase <name> --onto <branch>` | Rebase onto another branch instead of `main`. |
 | `./wt commit <name>` | Stage **all** changes in the worktree and commit with a generic message (`wip: DD-MM-YYYY HH:MM`). |
 | `./wt commit <name> -m "msg"` | Same, but with your own commit message. |
-| `./wt commit <name> --push` | Commit, then `git push -u origin HEAD` (creates the remote branch on first push). |
+| `./wt commit <name> --push` | Commit, then push and set the upstream (creates the remote branch on first push). |
+| `./wt push <name>` | Push the worktree's branch and set its upstream, without committing. |
+| `./wt push <name> --issue 12345` | Push it as **`#12345-<slug>`** (also `commit --push --issue`). The number is remembered. |
 | `./wt delete <name>` | Remove the worktree and delete its branch (only if it is contained in `origin/main`). |
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
@@ -154,6 +159,34 @@ Run from inside `wt-shallowflaws/`:
 | `./wt gitignore` | Rewrite the managed `.gitignore` block to match `dir_prefix`. |
 | `./wt gitignore --check` | Report whether it is up to date; exits non-zero if not (for CI / hooks). |
 | `./wt help` | Show usage. |
+
+## Issue numbers
+
+The local branch and the worktree directory always keep the `DD-MM-YYYY-N-<slug>`
+name. Give a branch an issue number and it is pushed under a different name,
+`#<issue>-<slug>` by default:
+
+```bash
+./wt create "add search" --issue 12345     # local: 10-09-2026-1-add-search
+./wt commit 10-09-2026-1-add-search --push # remote: origin/#12345-add-search
+
+# or decide at push time; "#12345" works too (quote it)
+./wt push 10-09-2026-1-add-search --issue 12345
+```
+
+- The number is stored in the branch's git config (`branch.<name>.wtissue`), so
+  later pushes need no flag and it is gone when the branch is deleted.
+- The remote name comes from **`remote_branch`**, with `{issue}`, `{slug}` and
+  `{name}` (the full local branch name) filled in, e.g.
+  `remote_branch: "app#{issue}-{slug}"`. Quote the value: YAML and `wt` both
+  read an unquoted `#` as the start of a comment.
+- The upstream is set to the issue-named branch, so `git pull`, `git status` and
+  `wt clean --gone` follow it. A bare **`git push` is refused by git** because
+  the names differ (`push.default=simple`) — push with `./wt push <name>`, or
+  `git push origin HEAD:<remote name>`.
+- Pushing with a different issue number creates a second remote branch; `wt`
+  prints the command to delete the old one.
+- Without an issue number nothing changes: the branch is pushed under its own name.
 
 ## Naming
 
