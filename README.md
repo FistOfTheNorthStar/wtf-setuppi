@@ -140,6 +140,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt commit <name> --push` | Commit, then push and set the upstream (creates the remote branch on first push). |
 | `./wt push <name>` | Push the worktree's branch and set its upstream, without committing. |
 | `./wt push <name> --issue 12345` | Push it as **`#12345-<slug>`** (also `commit --push --issue`). The number is remembered. |
+| `./wt push <name> --force-with-lease` | Overwrite the remote branch after a rebase (also `commit --push --force-with-lease`) — see [Behavior notes](#behavior-notes). |
 | `./wt delete <name>` | Remove the worktree and delete its branch (only if it is contained in `origin/main`). |
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
@@ -571,6 +572,12 @@ done
   branch with that name already exists, it is checked out instead of erroring.
 - **Rebase refuses on uncommitted changes**, and on conflict prints the exact
   `git rebase --continue` / `--abort` commands to run.
+- **Rebase never pushes.** A branch that was already pushed needs
+  `./wt push <name> --force-with-lease` afterwards; `rebase` says so when that
+  is the case. The push is refused if the remote branch has moved since you
+  last fetched it, or holds commits that were never part of your branch, so a
+  teammate's push is not overwritten. Permanent
+  branches are never force-pushed, and a first push stays a plain push.
 - **Delete only removes merged branches** automatically; an unmerged branch is
   kept and the `git branch -D` command to force-delete it is printed.
 - **Indices are recycled.** Deleting worktree 2 frees index 2 (and ports 8020+)
@@ -630,7 +637,7 @@ test_create_makes_prefixed_dir_and_bare_branch() {
 
 Config parsing, naming and prefixes, the generated `.gitignore`, seeding,
 indices and ports, `post_create`, activation and its hooks, `list`/`path`/
-`exec`/`each`, `delete`/`clean`/`rebase`/`commit`, concurrent `create`, and
+`exec`/`each`, `delete`/`clean`/`rebase`/`commit`/`push`, concurrent `create`, and
 awkward layouts (paths with spaces, symlinked roots, legacy unprefixed
 directories). Every bug found while building `wt` has a regression test — each
 is commented with the failure it locks down, so the reason it exists survives.
