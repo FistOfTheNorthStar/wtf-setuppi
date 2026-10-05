@@ -11,13 +11,17 @@
 # Commands:
 #   wt create <slug> [--from <branch>]   create a worktree named <date>-N-<slug>
 #                                        (branch off latest main, or off <branch>
-#                                        with --from; use --raw to name it verbatim)
+#                                        with --from; use --raw to name it verbatim;
+#                                        --issue <n> names it after the issue on push)
 #   wt delete <name> [--force] [--keep-branch]
 #                                        remove a worktree (and its branch)
 #   wt clean --merged|--gone [--dry-run] [--yes]
 #                                        remove finished worktrees in bulk
 #   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
 #   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
+#   wt push <name> [--issue <n>]         push a worktree's branch; with an issue number
+#                                        (given here or at create) the branch on the
+#                                        remote is named by remote_branch, e.g. #12345-<slug>
 #   wt exec <name> -- <cmd>              run a command inside one worktree
 #   wt each [--keep-going] -- <cmd>      run a command inside every worktree
 #   wt activate <name>                   make <name> the active worktree
@@ -182,6 +186,7 @@ load_config() {
   REMOTE="${WT_REMOTE:-$(yml_get remote "$cfg")}"
   DATE_FMT="${WT_DATE_FORMAT:-$(yml_get date_format "$cfg")}"
   COMMIT_PREFIX="${WT_COMMIT_PREFIX:-$(yml_get commit_prefix "$cfg")}"
+  REMOTE_BRANCH_FMT="${WT_REMOTE_BRANCH:-$(yml_get remote_branch "$cfg")}"
   PORT_BASE_CFG="${WT_PORT_BASE_CFG:-$(yml_get port_base "$cfg")}"
   PORT_STRIDE="${WT_PORT_STRIDE:-$(yml_get port_stride "$cfg")}"
   POST_CREATE="${WT_POST_CREATE:-$(yml_cmd post_create "$cfg")}"
@@ -227,6 +232,11 @@ load_config() {
   : "${REMOTE:=origin}"
   : "${DATE_FMT:=%d-%m-%Y}"
   : "${COMMIT_PREFIX:=wip}"
+  [ -n "$REMOTE_BRANCH_FMT" ] || REMOTE_BRANCH_FMT='#{issue}-{slug}'
+  case "$REMOTE_BRANCH_FMT" in
+    *'{issue}'*) ;;
+    *) die "remote_branch must contain {issue}, got: $REMOTE_BRANCH_FMT" ;;
+  esac
   : "${PORT_STRIDE:=10}"
   case "$DIR_PREFIX" in
     */*) die "dir_prefix must not contain '/': $DIR_PREFIX" ;;
@@ -275,6 +285,7 @@ cmd_config() {
   printf 'remote      : %s\n' "$REMOTE"
   printf 'date_format : %s\n' "$DATE_FMT"
   printf 'commit_prefix: %s\n' "$COMMIT_PREFIX"
+  printf 'remote_branch: %s\n' "$REMOTE_BRANCH_FMT"
   printf 'port_base   : %s\n' "${PORT_BASE_CFG:-(disabled)}"
   printf 'port_stride : %s\n' "$PORT_STRIDE"
   printf 'post_create : %s\n' "${POST_CREATE:-(none)}"
@@ -708,6 +719,69 @@ generate_name() {
   printf '%s-%s-%s' "$today" "$((max + 1))" "$slug"
 }
 
+# ---- issue-named remote branches ------------------------------------------
+# A branch can carry an issue number (create/commit/push --issue). It only
+# changes the name the branch is pushed under: the local branch and the
+# worktree directory keep their <date>-N-<slug> name. The number lives in the
+# branch's own git config, so it goes away with the branch.
+normalize_issue() {
+  local n="${1#\#}"
+  case "$n" in
+    ''|*[!0-9]*) die "Issue must be a number like 12345 or #12345, got: '$1'" ;;
+  esac
+  printf '%s' "$n"
+}
+
+issue_get() { git_base config --get "branch.$1.wtissue" || true; }
+
+# The name <branch> gets on the remote for <issue>: remote_branch with {issue},
+# {slug} and {name} filled in. The slug is recorded by create; for a branch
+# that predates that, strip a leading <date>-N- if there is one.
+remote_branch_name() {
+  local b="$1" issue="$2" slug out k
+  slug="$(git_base config --get "branch.$b.wtslug" || true)"
+  if [ -z "$slug" ]; then
+    slug="$b"
+    if [[ "$b" =~ ^[0-9]+[-._][0-9]+[-._][0-9]+-[0-9]+-(.+)$ ]]; then
+      slug="${BASH_REMATCH[1]}"
+    fi
+  fi
+  out="$REMOTE_BRANCH_FMT"
+  k='{issue}'; out="${out//$k/$issue}"
+  k='{slug}';  out="${out//$k/$slug}"
+  k='{name}';  out="${out//$k/$b}"
+  printf '%s' "$out"
+}
+
+# Push the branch checked out in a worktree and set its upstream. With an issue
+# number (passed now, or recorded earlier) it is pushed as remote_branch.
+push_worktree() {
+  local name="$1" path="$2" issue="$3" branch target prev
+  branch="$(git -C "$path" symbolic-ref --quiet --short HEAD)" \
+    || die "Worktree '$name' is on a detached HEAD; nothing to push."
+  if [ -n "$issue" ]; then
+    is_permanent "$branch" \
+      && die "'$branch' is a permanent branch; it is always pushed under its own name."
+    git_base config "branch.$branch.wtissue" "$issue"
+  fi
+  issue="$(issue_get "$branch")"
+  target="$branch"
+  if [ -n "$issue" ]; then
+    target="$(remote_branch_name "$branch" "$issue")"
+    git check-ref-format "refs/heads/$target" \
+      || die "remote_branch gives an invalid branch name: '$target'"
+  fi
+  prev="$(git_base config --get "branch.$branch.merge" || true)"
+  prev="${prev#refs/heads/}"
+  if [ -n "$prev" ] && [ "$prev" != "$target" ]; then
+    warn "'$branch' was pushed as $REMOTE/$prev before; that branch stays. Remove it with: git -C $BASE_REPO push $REMOTE --delete '$prev'"
+  fi
+
+  info "Pushing '$branch' to $REMOTE/$target ..."
+  git -C "$path" push -u "$REMOTE" "HEAD:refs/heads/$target" >&2
+  ok "Pushed to $REMOTE/$target."
+}
+
 # ---- seeding new worktrees ------------------------------------------------
 # Resolve a copy:/link: entry to "source<TAB>destination".
 seed_paths() {
@@ -872,12 +946,14 @@ ff_branch() {
 
 # ---- commands -------------------------------------------------------------
 cmd_create() {
-  local input="" from="" raw=0 hook=1 activate=0
+  local input="" from="" raw=0 hook=1 activate=0 issue=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --from|-b) from="${2:-}"; shift 2 ;;
       --from=*)  from="${1#*=}"; shift ;;
       --raw)     raw=1; shift ;;
+      --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
+      --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
       --no-hook) hook=0; shift ;;
       --activate) activate=1; shift ;;
       -*) die "Unknown flag for create: $1" ;;
@@ -932,6 +1008,11 @@ cmd_create() {
     # the worktree isn't misreported as "tracking main" and `git pull` here
     # doesn't pull main. First push should use `git push -u origin HEAD`.
     git_base worktree add --no-track -b "$name" "$path" "$base_ref" >&2
+    [ "$raw" -eq 1 ] || git_base config "branch.$name.wtslug" "$(slugify "$input")"
+  fi
+  if [ -n "$issue" ]; then
+    is_permanent "$name" && die "'$name' is a permanent branch; it can't take --issue."
+    git_base config "branch.$name.wtissue" "$issue"
   fi
 
   local idx port
@@ -956,6 +1037,7 @@ cmd_create() {
   else
     ok "Worktree ready: $path  (branch: $name, index: $idx)"
   fi
+  [ -z "$issue" ] || info "Will be pushed as $REMOTE/$(remote_branch_name "$name" "$issue")."
 
   local rc=0
   if [ "$hook" -eq 1 ]; then run_post_create "$name" "$path" || rc=$?; fi
@@ -1165,16 +1247,19 @@ cmd_rebase() {
 }
 
 cmd_commit() {
-  local name="" msg="" push=0
+  local name="" msg="" push=0 issue=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --push|-p) push=1; shift ;;
+      --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
+      --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
       -m) msg="${2:-}"; shift 2 ;;
       -*) die "Unknown flag for commit: $1" ;;
       *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
     esac
   done
   require_name "$name"
+  [ -z "$issue" ] || [ "$push" -eq 1 ] || die "--issue names the pushed branch; use it with --push."
   local path; path="$(find_wt_path "$name")"
   [ -d "$path" ] || die "No worktree at $path"
 
@@ -1189,11 +1274,23 @@ cmd_commit() {
     ok "Committed: $msg"
   fi
 
-  if [ "$push" -eq 1 ]; then
-    info "Pushing '$name' to $REMOTE ..."
-    git -C "$path" push -u "$REMOTE" HEAD >&2
-    ok "Pushed."
-  fi
+  if [ "$push" -eq 1 ]; then push_worktree "$name" "$path" "$issue"; fi
+}
+
+cmd_push() {
+  local name="" issue=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
+      --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
+      -*) die "Unknown flag for push: $1" ;;
+      *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$name"
+  local path; path="$(find_wt_path "$name")"
+  [ -d "$path" ] || die "No worktree at $path"
+  push_worktree "$name" "$path" "$issue"
 }
 
 cmd_path() {
@@ -1338,6 +1435,7 @@ case "$cmd" in
   clean) cmd_clean "$@" ;;
   rebase) cmd_rebase "$@" ;;
   commit) cmd_commit "$@" ;;
+  push) cmd_push "$@" ;;
   exec) cmd_exec "$@" ;;
   each) cmd_each "$@" ;;
   path) cmd_path "$@" ;;
