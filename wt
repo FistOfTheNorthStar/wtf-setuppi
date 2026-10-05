@@ -19,9 +19,12 @@
 #                                        remove finished worktrees in bulk
 #   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
 #   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
-#   wt push <name> [--issue <n>]         push a worktree's branch; with an issue number
+#   wt push <name> [--issue <n>] [--force-with-lease]
+#                                        push a worktree's branch; with an issue number
 #                                        (given here or at create) the branch on the
-#                                        remote is named by remote_branch, e.g. #12345-<slug>
+#                                        remote is named by remote_branch, e.g. #12345-<slug>;
+#                                        --force-with-lease (also on commit --push)
+#                                        overwrites the remote branch after a rebase
 #   wt exec <name> -- <cmd>              run a command inside one worktree
 #   wt each [--keep-going] -- <cmd>      run a command inside every worktree
 #   wt activate <name>                   make <name> the active worktree
@@ -753,12 +756,32 @@ remote_branch_name() {
   printf '%s' "$out"
 }
 
+# Whether <commit> is, or once was, part of <branch>: reachable from its tip or
+# from an earlier tip in its reflog (what it pointed at before a rebase). This
+# is git's --force-if-includes, which cannot be used here because it looks for
+# a local branch named like the remote one, and an issue-named branch has none.
+branch_has_included() {
+  local path="$1" branch="$2" commit="$3" tip
+  while read -r tip; do
+    git -C "$path" merge-base --is-ancestor "$commit" "$tip" 2>/dev/null && return 0
+  done < <(git -C "$path" rev-parse "refs/heads/$branch"
+           git -C "$path" log -g --format=%H "refs/heads/$branch" 2>/dev/null)
+  return 1
+}
+
 # Push the branch checked out in a worktree and set its upstream. With an issue
 # number (passed now, or recorded earlier) it is pushed as remote_branch.
+# With <force> = 1 the remote branch is overwritten (after a rebase), but only
+# if it is still where we last saw it and that commit has been in this branch:
+# someone else's push, fetched or not, is never thrown away.
 push_worktree() {
-  local name="$1" path="$2" issue="$3" branch target prev
+  local name="$1" path="$2" issue="$3" force="${4:-0}" branch target prev seen
+  local -a flags=()
   branch="$(git -C "$path" symbolic-ref --quiet --short HEAD)" \
     || die "Worktree '$name' is on a detached HEAD; nothing to push."
+  if [ "$force" -eq 1 ] && is_permanent "$branch"; then
+    die "'$branch' is a permanent branch; it is never force-pushed."
+  fi
   if [ -n "$issue" ]; then
     is_permanent "$branch" \
       && die "'$branch' is a permanent branch; it is always pushed under its own name."
@@ -777,8 +800,19 @@ push_worktree() {
     warn "'$branch' was pushed as $REMOTE/$prev before; that branch stays. Remove it with: git -C $BASE_REPO push $REMOTE --delete '$prev'"
   fi
 
+  # Nothing to overwrite on a first push, so it stays a plain one.
+  if [ "$force" -eq 1 ] \
+     && seen="$(git -C "$path" rev-parse --verify --quiet "refs/remotes/$REMOTE/$target")"; then
+    branch_has_included "$path" "$branch" "$seen" \
+      || die "$REMOTE/$target has commits that were never part of '$branch'; integrate them first (git -C $path rebase $REMOTE/$target), then push again."
+    flags=("--force-with-lease=refs/heads/$target:$seen")
+  fi
+
   info "Pushing '$branch' to $REMOTE/$target ..."
-  git -C "$path" push -u "$REMOTE" "HEAD:refs/heads/$target" >&2
+  if ! git -C "$path" push ${flags[@]+"${flags[@]}"} -u "$REMOTE" "$branch:refs/heads/$target" >&2; then
+    [ "$force" -eq 1 ] && die "Push to $REMOTE/$target was rejected: it has moved since the last fetch. Fetch and integrate it first."
+    die "Push to $REMOTE/$target was rejected. If you rebased, re-run with --force-with-lease; if $REMOTE/$target has new commits, integrate them first."
+  fi
   ok "Pushed to $REMOTE/$target."
 }
 
@@ -1239,6 +1273,10 @@ cmd_rebase() {
   info "Rebasing '$name' onto $target ..."
   if git -C "$path" rebase "$target" >&2; then
     ok "Rebased '$name' onto $target."
+    if git -C "$path" rev-parse --verify --quiet '@{upstream}' >/dev/null 2>&1 \
+       && ! git -C "$path" merge-base --is-ancestor '@{upstream}' HEAD; then
+      info "Already pushed; update the remote branch with: wt push $name --force-with-lease"
+    fi
   else
     warn "Rebase hit conflicts. Resolve in $path, then: git -C $path rebase --continue"
     warn "Or abort with: git -C $path rebase --abort"
@@ -1247,10 +1285,11 @@ cmd_rebase() {
 }
 
 cmd_commit() {
-  local name="" msg="" push=0 issue=""
+  local name="" msg="" push=0 issue="" force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --push|-p) push=1; shift ;;
+      --force-with-lease) force=1; shift ;;
       --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
       --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
       -m) msg="${2:-}"; shift 2 ;;
@@ -1260,6 +1299,7 @@ cmd_commit() {
   done
   require_name "$name"
   [ -z "$issue" ] || [ "$push" -eq 1 ] || die "--issue names the pushed branch; use it with --push."
+  [ "$force" -eq 0 ] || [ "$push" -eq 1 ] || die "--force-with-lease is about pushing; use it with --push."
   local path; path="$(find_wt_path "$name")"
   [ -d "$path" ] || die "No worktree at $path"
 
@@ -1274,15 +1314,16 @@ cmd_commit() {
     ok "Committed: $msg"
   fi
 
-  if [ "$push" -eq 1 ]; then push_worktree "$name" "$path" "$issue"; fi
+  if [ "$push" -eq 1 ]; then push_worktree "$name" "$path" "$issue" "$force"; fi
 }
 
 cmd_push() {
-  local name="" issue=""
+  local name="" issue="" force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
       --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
+      --force-with-lease) force=1; shift ;;
       -*) die "Unknown flag for push: $1" ;;
       *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
     esac
@@ -1290,7 +1331,7 @@ cmd_push() {
   require_name "$name"
   local path; path="$(find_wt_path "$name")"
   [ -d "$path" ] || die "No worktree at $path"
-  push_worktree "$name" "$path" "$issue"
+  push_worktree "$name" "$path" "$issue" "$force"
 }
 
 cmd_path() {
