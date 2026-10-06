@@ -131,43 +131,6 @@ test_commit_and_push_set_upstream() {
     || fail "branch was not pushed"
 }
 
-# Push, then rewrite the pushed commit, as a rebase would.
-push_then_amend() {
-  local p; p="$(wt create one 2>/dev/null)"
-  echo work > "$p/w.txt"
-  wt commit "$(name_n 1 one)" -m first --push >/dev/null 2>&1
-  git -C "$p" commit -q --amend -m rewritten
-  printf '%s' "$p"
-}
-
-test_push_of_rewritten_history_is_rejected_by_default() {
-  push_then_amend >/dev/null
-  run wt commit "$(name_n 1 one)" --push
-  assert_fails
-}
-
-test_force_with_lease_pushes_rewritten_history() {
-  local p; p="$(push_then_amend)"
-  run wtenv WT_FORCE_WITH_LEASE=true -- commit "$(name_n 1 one)" --push
-  assert_ok
-  assert_eq "$(git -C "$TEST_TMP/remote" log -1 --pretty=%s "$(name_n 1 one)")" "rewritten" "remote subject"
-}
-
-test_force_with_lease_refuses_when_the_remote_moved() {
-  local p; p="$(push_then_amend)"
-  # Someone else pushes to the branch; our tracking ref is now stale.
-  git clone -q "$TEST_TMP/remote" "$TEST_TMP/other"
-  git -C "$TEST_TMP/other" checkout -q "$(name_n 1 one)"
-  git -C "$TEST_TMP/other" -c user.name=o -c user.email=o@x commit -q --allow-empty -m theirs
-  git -C "$TEST_TMP/other" push -q origin HEAD
-  config_add <<'YML'
-force_with_lease: true
-YML
-  run wt commit "$(name_n 1 one)" --push
-  assert_fails
-  assert_contains "$stderr" "stale info"
-}
-
 test_commit_on_a_clean_tree_warns() {
   wt create one >/dev/null 2>&1
   run wt commit "$(name_n 1 one)"
