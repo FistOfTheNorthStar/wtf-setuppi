@@ -808,7 +808,7 @@ push_worktree() {
     die "'$branch' is a permanent branch; it is never force-pushed."
   fi
   # force_with_lease: true makes it the default, except for permanent branches.
-  if [ "$force" -eq 0 ] && [ "$FORCE_WITH_LEASE" -eq 1 ] && ! is_permanent "$branch"; then
+  if [ "$force" -eq 0 ] && [ "$FORCE_WITH_LEASE" -eq 1 ]; then
     force=1
   fi
   if [ -n "$issue" ]; then

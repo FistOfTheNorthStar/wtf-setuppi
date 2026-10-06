@@ -1,4 +1,7 @@
 # shellcheck shell=bash
+# Sourced by tests/run.sh after helpers.sh, in the same shell: run() assigns
+# $status/$stdout/$stderr.
+# shellcheck disable=SC2154
 # Issue numbers: the local branch keeps its <date>-N-<slug> name, the branch on
 # the remote is named after the issue.
 

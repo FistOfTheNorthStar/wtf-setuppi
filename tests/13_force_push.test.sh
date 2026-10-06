@@ -128,3 +128,71 @@ test_commit_force_with_lease_without_push_is_refused() {
   assert_fails
   assert_contains "$stderr" "use it with --push"
 }
+
+# force_with_lease: true makes every push behave as if --force-with-lease was given.
+use_force_with_lease() {
+  config_add <<'YML'
+force_with_lease: true
+YML
+}
+
+test_force_with_lease_config_pushes_a_rebased_branch() {
+  pushed_and_rebased
+  use_force_with_lease
+  run wt push "$n"
+  assert_ok
+  assert_eq "$(remote_head "$n")" "$(git -C "$p" rev-parse HEAD)" "remote head"
+}
+
+test_force_with_lease_env_applies_to_commit_push() {
+  pushed_and_rebased
+  echo more > "$p/more.txt"
+  run wtenv WT_FORCE_WITH_LEASE=true -- commit "$n" -m more --push
+  assert_ok
+  assert_eq "$(remote_head "$n")" "$(git -C "$p" rev-parse HEAD)" "remote head"
+}
+
+test_force_with_lease_config_keeps_a_fetched_but_unmerged_push() {
+  pushed_and_rebased
+  use_force_with_lease
+  git -C "$TEST_TMP/other" fetch -q origin
+  git -C "$TEST_TMP/other" checkout -q -b theirs "origin/$n"
+  echo theirs > "$TEST_TMP/other/theirs.txt"
+  git -C "$TEST_TMP/other" add -A
+  git -C "$TEST_TMP/other" commit -qm theirs
+  git -C "$TEST_TMP/other" push -q origin "theirs:$n"
+  local theirs; theirs="$(remote_head "$n")"
+  git -C "$p" fetch -q origin
+  run wt push "$n"
+  assert_fails
+  assert_contains "$stderr" "never part of"
+  assert_eq "$(remote_head "$n")" "$theirs" "remote head"
+}
+
+# The config default skips permanent branches: they are pushed, but a
+# rewritten one is rejected like any plain push instead of overwritten.
+test_force_with_lease_config_never_force_pushes_permanent_branches() {
+  base_git branch production
+  base_git push -q origin production
+  config_add <<'YML'
+permanent:
+  - production
+YML
+  use_force_with_lease
+  local pp; pp="$(wt create production --raw 2>/dev/null)"
+  echo prod > "$pp/prod.txt"
+  run wt commit production -m prod --push
+  assert_ok
+  local pushed; pushed="$(remote_head production)"
+  git -C "$pp" commit -q --amend -m rewritten
+  run wt push production
+  assert_fails
+  assert_eq "$(remote_head production)" "$pushed" "remote head"
+}
+
+test_config_shows_force_with_lease() {
+  use_force_with_lease
+  run wt config
+  assert_ok
+  assert_contains "$stdout" "force_with_lease: true"
+}
