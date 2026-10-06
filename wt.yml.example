@@ -19,6 +19,7 @@ date_format: "%d-%m-%Y"        # WT_DATE_FORMAT    — date prefix for auto-name
 name_date: true                # WT_NAME_DATE      — include the date in auto-names (DATE-N-slug)
 name_number: true              # WT_NAME_NUMBER    — include the sequence number N in auto-names
 commit_prefix: wip             # WT_COMMIT_PREFIX  — default `wt commit` message prefix
+force_with_lease: false        # WT_FORCE_WITH_LEASE — `wt commit --push` uses --force-with-lease
 
 # ---- the active worktree --------------------------------------------------
 

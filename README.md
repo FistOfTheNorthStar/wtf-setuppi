@@ -48,6 +48,7 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `date_format` | `strftime` format for the date in auto-named branches | `%d-%m-%Y` |
 | `name_date` / `name_number` | Include the date / the sequence number in auto-names — see [Naming](#naming) | `true` / `true` |
 | `commit_prefix` | Prefix for `wt commit`'s default message | `wip` |
+| `force_with_lease` | Make every `wt commit --push` a `--force-with-lease` push, so a rebased branch goes through | `false` |
 | `copy` / `link` | Ignored files each worktree needs (`.env`, `.venv`) — see [Parallel worktrees](#parallel-worktrees-and-agents) | — |
 | `port_base` / `port_stride` | Give each worktree its own port range | off / `10` |
 | `post_create` | Command to run in a freshly created worktree | — |
@@ -86,6 +87,7 @@ date_format: "%d-%m-%Y"        # date prefix for auto-named branches (strftime)
 name_date: true                # include the date in auto-names
 name_number: true              # include the sequence number in auto-names
 commit_prefix: wip             # default `wt commit` message prefix
+force_with_lease: false        # push with --force-with-lease (after rebases)
 
 port_base: 8000                # worktree N gets ports 8000 + N*port_stride
 port_stride: 10
@@ -100,7 +102,7 @@ link:                          # shared with the base repo via symlink
 Every key can also be overridden per-run by its matching env var:
 `WT_BASE_REPO`, `WT_WORKTREE_ROOT`, `WT_DIR_PREFIX`, `WT_MANAGE_GITIGNORE`,
 `WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_DATE_FORMAT`, `WT_NAME_DATE`,
-`WT_NAME_NUMBER`, `WT_COMMIT_PREFIX`,
+`WT_NAME_NUMBER`, `WT_COMMIT_PREFIX`, `WT_FORCE_WITH_LEASE`,
 `WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_ACTIVE_LINK`,
 `WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK`
 (space-separated). Run `./wt config` to print the resolved settings.
@@ -136,7 +138,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt rebase <name> --onto <branch>` | Rebase onto another branch instead of `main`. |
 | `./wt commit <name>` | Stage **all** changes in the worktree and commit with a generic message (`wip: DD-MM-YYYY HH:MM`). |
 | `./wt commit <name> -m "msg"` | Same, but with your own commit message. |
-| `./wt commit <name> --push` | Commit, then `git push -u origin HEAD` (creates the remote branch on first push). |
+| `./wt commit <name> --push` | Commit, then `git push -u origin HEAD` (creates the remote branch on first push). With `force_with_lease: true` it is `git push --force-with-lease`, so a branch you rebased can be pushed. |
 | `./wt delete <name>` | Remove the worktree and delete its branch (only if fully merged). |
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
@@ -518,6 +520,9 @@ done
   fast-forward is skipped with a warning rather than clobbering your work.
 - **New branch name = worktree directory name**, minus `dir_prefix`. If a
   branch with that name already exists, it is checked out instead of erroring.
+- **Pushing after a rebase** is rejected as non-fast-forward unless
+  `force_with_lease: true`. The lease still refuses if the remote branch moved
+  since your last fetch, so it won't overwrite someone else's push.
 - **Rebase refuses on uncommitted changes**, and on conflict prints the exact
   `git rebase --continue` / `--abort` commands to run.
 - **Delete only removes merged branches** automatically; an unmerged branch is
@@ -538,7 +543,7 @@ done
 ./tests/run.sh --no-lint      # skip shellcheck
 ```
 
-109 tests, ~15s. No dependencies beyond bash and git — no bats, no npm.
+112 tests, ~15s. No dependencies beyond bash and git — no bats, no npm.
 
 Each test runs in its own subshell with `set -e` (so the first failed assertion
 ends that test) against its own throwaway git repos under `$TMPDIR`: a bare

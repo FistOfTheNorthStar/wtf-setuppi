@@ -18,7 +18,8 @@
 #   wt clean --merged|--gone [--dry-run] [--yes]
 #                                        remove finished worktrees in bulk
 #   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
-#   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
+#   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default;
+#                                        force_with_lease: true makes the push --force-with-lease)
 #   wt exec <name> -- <cmd>              run a command inside one worktree
 #   wt each [--keep-going] -- <cmd>      run a command inside every worktree
 #   wt activate <name>                   make <name> the active worktree
@@ -193,6 +194,7 @@ load_config() {
   NAME_DATE="${WT_NAME_DATE:-$(yml_get name_date "$cfg")}"
   NAME_NUMBER="${WT_NAME_NUMBER:-$(yml_get name_number "$cfg")}"
   COMMIT_PREFIX="${WT_COMMIT_PREFIX:-$(yml_get commit_prefix "$cfg")}"
+  FORCE_WITH_LEASE="${WT_FORCE_WITH_LEASE:-$(yml_get force_with_lease "$cfg")}"
   PORT_BASE_CFG="${WT_PORT_BASE_CFG:-$(yml_get port_base "$cfg")}"
   PORT_STRIDE="${WT_PORT_STRIDE:-$(yml_get port_stride "$cfg")}"
   POST_CREATE="${WT_POST_CREATE:-$(yml_cmd post_create "$cfg")}"
@@ -234,6 +236,7 @@ load_config() {
   : "${NAME_DATE:=true}"
   : "${NAME_NUMBER:=true}"
   : "${COMMIT_PREFIX:=wip}"
+  : "${FORCE_WITH_LEASE:=false}"
   : "${PORT_STRIDE:=10}"
   case "$DIR_PREFIX" in
     */*) die "dir_prefix must not contain '/': $DIR_PREFIX" ;;
@@ -241,6 +244,7 @@ load_config() {
   MANAGE_GITIGNORE="$(parse_bool manage_gitignore "$MANAGE_GITIGNORE")"
   NAME_DATE="$(parse_bool name_date "$NAME_DATE")"
   NAME_NUMBER="$(parse_bool name_number "$NAME_NUMBER")"
+  FORCE_WITH_LEASE="$(parse_bool force_with_lease "$FORCE_WITH_LEASE")"
   if [ -n "$PORT_BASE_CFG" ]; then
     case "$PORT_BASE_CFG" in
       *[!0-9]*) die "port_base must be a number, got: $PORT_BASE_CFG" ;;
@@ -282,6 +286,7 @@ cmd_config() {
   printf 'name_date   : %s\n' "$( [ "$NAME_DATE" -eq 1 ] && echo true || echo false )"
   printf 'name_number : %s\n' "$( [ "$NAME_NUMBER" -eq 1 ] && echo true || echo false )"
   printf 'commit_prefix: %s\n' "$COMMIT_PREFIX"
+  printf 'force_with_lease: %s\n' "$( [ "$FORCE_WITH_LEASE" -eq 1 ] && echo true || echo false )"
   printf 'port_base   : %s\n' "${PORT_BASE_CFG:-(disabled)}"
   printf 'port_stride : %s\n' "$PORT_STRIDE"
   printf 'post_create : %s\n' "${POST_CREATE:-(none)}"
@@ -1142,8 +1147,12 @@ cmd_commit() {
   fi
 
   if [ "$push" -eq 1 ]; then
+    # --force-with-lease lets a rebased branch through, but still refuses if the
+    # remote moved since our last fetch (someone else pushed to it).
+    local -a push_args=(-u)
+    [ "$FORCE_WITH_LEASE" -eq 1 ] && push_args+=(--force-with-lease)
     info "Pushing '$name' to $REMOTE ..."
-    git -C "$path" push -u "$REMOTE" HEAD >&2
+    git -C "$path" push "${push_args[@]}" "$REMOTE" HEAD >&2
     ok "Pushed."
   fi
 }
