@@ -16,6 +16,8 @@ manage_gitignore: true         # WT_MANAGE_GITIGNORE — let wt maintain that .g
 main_branch: main              # WT_MAIN_BRANCH    — base branch, always pulled to latest
 remote: origin                 # WT_REMOTE         — git remote to fetch/push
 date_format: "%d-%m-%Y"        # WT_DATE_FORMAT    — date prefix for auto-named branches (strftime)
+name_date: true                # WT_NAME_DATE      — include the date in auto-names (DATE-N-slug)
+name_number: true              # WT_NAME_NUMBER    — include the sequence number N in auto-names
 commit_prefix: wip             # WT_COMMIT_PREFIX  — default `wt commit` message prefix
 
 # ---- the active worktree --------------------------------------------------

@@ -11,7 +11,8 @@
 # Commands:
 #   wt create <slug> [--from <branch>]   create a worktree named <date>-N-<slug>
 #                                        (branch off latest main, or off <branch>
-#                                        with --from; use --raw to name it verbatim)
+#                                        with --from; use --raw to name it verbatim;
+#                                        name_date / name_number drop either part)
 #   wt delete <name> [--force] [--keep-branch]
 #                                        remove a worktree (and its branch)
 #   wt clean --merged|--gone [--dry-run] [--yes]
@@ -167,6 +168,15 @@ resolve_path() {
   esac
 }
 
+# Normalize a yml/env boolean to 1 or 0; die naming the key otherwise.
+parse_bool() {
+  case "$2" in
+    true|yes|1)  printf 1 ;;
+    false|no|0)  printf 0 ;;
+    *) die "$1 must be true or false, got: $2" ;;
+  esac
+}
+
 load_config() {
   local cfg cfg_dir
   cfg="$(find_config)"
@@ -180,6 +190,8 @@ load_config() {
   MAIN_BRANCH="${WT_MAIN_BRANCH:-$(yml_get main_branch "$cfg")}"
   REMOTE="${WT_REMOTE:-$(yml_get remote "$cfg")}"
   DATE_FMT="${WT_DATE_FORMAT:-$(yml_get date_format "$cfg")}"
+  NAME_DATE="${WT_NAME_DATE:-$(yml_get name_date "$cfg")}"
+  NAME_NUMBER="${WT_NAME_NUMBER:-$(yml_get name_number "$cfg")}"
   COMMIT_PREFIX="${WT_COMMIT_PREFIX:-$(yml_get commit_prefix "$cfg")}"
   PORT_BASE_CFG="${WT_PORT_BASE_CFG:-$(yml_get port_base "$cfg")}"
   PORT_STRIDE="${WT_PORT_STRIDE:-$(yml_get port_stride "$cfg")}"
@@ -219,16 +231,16 @@ load_config() {
   : "${MAIN_BRANCH:=main}"
   : "${REMOTE:=origin}"
   : "${DATE_FMT:=%d-%m-%Y}"
+  : "${NAME_DATE:=true}"
+  : "${NAME_NUMBER:=true}"
   : "${COMMIT_PREFIX:=wip}"
   : "${PORT_STRIDE:=10}"
   case "$DIR_PREFIX" in
     */*) die "dir_prefix must not contain '/': $DIR_PREFIX" ;;
   esac
-  case "$MANAGE_GITIGNORE" in
-    true|yes|1)  MANAGE_GITIGNORE=1 ;;
-    false|no|0)  MANAGE_GITIGNORE=0 ;;
-    *) die "manage_gitignore must be true or false, got: $MANAGE_GITIGNORE" ;;
-  esac
+  MANAGE_GITIGNORE="$(parse_bool manage_gitignore "$MANAGE_GITIGNORE")"
+  NAME_DATE="$(parse_bool name_date "$NAME_DATE")"
+  NAME_NUMBER="$(parse_bool name_number "$NAME_NUMBER")"
   if [ -n "$PORT_BASE_CFG" ]; then
     case "$PORT_BASE_CFG" in
       *[!0-9]*) die "port_base must be a number, got: $PORT_BASE_CFG" ;;
@@ -267,6 +279,8 @@ cmd_config() {
   printf 'main_branch : %s\n' "$MAIN_BRANCH"
   printf 'remote      : %s\n' "$REMOTE"
   printf 'date_format : %s\n' "$DATE_FMT"
+  printf 'name_date   : %s\n' "$( [ "$NAME_DATE" -eq 1 ] && echo true || echo false )"
+  printf 'name_number : %s\n' "$( [ "$NAME_NUMBER" -eq 1 ] && echo true || echo false )"
   printf 'commit_prefix: %s\n' "$COMMIT_PREFIX"
   printf 'port_base   : %s\n' "${PORT_BASE_CFG:-(disabled)}"
   printf 'port_stride : %s\n' "$PORT_STRIDE"
@@ -646,15 +660,21 @@ slugify() {
 
 # Build a branch name in the DD-MM-YYYY-N-slug convention. N is the next unused
 # sequence number for today, based on existing branches and worktree dirs.
+# name_date / name_number drop either part: DATE-slug, N-slug or just slug.
+# Without the date, N counts across every <N>-<slug> name, not just today's.
 generate_name() {
-  local slug today max n branch
+  local slug prefix="" max n branch
   slug="$(slugify "$1")"
   [ -n "$slug" ] || die "Slug is empty after normalizing '$1'."
-  today="$(date "+$DATE_FMT")"
+  [ "$NAME_DATE" -eq 1 ] && prefix="$(date "+$DATE_FMT")-"
+  if [ "$NAME_NUMBER" -eq 0 ]; then
+    printf '%s%s' "$prefix" "$slug"
+    return
+  fi
   max=0
-  # Scan existing branches for today's prefix.
+  # Scan existing branches for the prefix.
   while IFS= read -r branch; do
-    if [[ "$branch" =~ ^${today}-([0-9]+)- ]]; then
+    if [[ "$branch" =~ ^${prefix}([0-9]+)- ]]; then
       n="${BASH_REMATCH[1]}"
       (( n > max )) && max="$n"
     fi
@@ -666,12 +686,12 @@ generate_name() {
     [ -e "$d" ] || continue
     base="$(basename "$d")"
     base="${base#"$DIR_PREFIX"}"        # no-op when dir_prefix is empty
-    if [[ "$base" =~ ^${today}-([0-9]+)- ]]; then
+    if [[ "$base" =~ ^${prefix}([0-9]+)- ]]; then
       n="${BASH_REMATCH[1]}"
       (( n > max )) && max="$n"
     fi
   done
-  printf '%s-%s-%s' "$today" "$((max + 1))" "$slug"
+  printf '%s%s-%s' "$prefix" "$((max + 1))" "$slug"
 }
 
 # ---- seeding new worktrees ------------------------------------------------
