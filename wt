@@ -13,19 +13,27 @@
 #                                        (branch off latest main, or off <branch>
 #                                        with --from; use --raw to name it verbatim;
 #                                        name_date / name_number drop either part)
+#                                        --issue <n> names it after the issue on push)
 #   wt delete <name> [--force] [--keep-branch]
 #                                        remove a worktree (and its branch)
 #   wt clean --merged|--gone [--dry-run] [--yes]
 #                                        remove finished worktrees in bulk
 #   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
-#   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default;
-#                                        force_with_lease: true makes the push --force-with-lease)
+#   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
+#   wt push <name> [--issue <n>] [--force-with-lease]
+#                                        push a worktree's branch; with an issue number
+#                                        (given here or at create) the branch on the
+#                                        remote is named by remote_branch, e.g. #12345-<slug>;
+#                                        --force-with-lease (also on commit --push)
+#                                        overwrites the remote branch after a rebase
+#                                        (force_with_lease: true makes it the default)
 #   wt exec <name> -- <cmd>              run a command inside one worktree
 #   wt each [--keep-going] -- <cmd>      run a command inside every worktree
 #   wt activate <name>                   make <name> the active worktree
 #   wt active [--path]                   print the active worktree
 #   wt path <name>                       print a worktree's path
-#   wt update                            fetch remote and fast-forward main in the base repo
+#   wt update                            fetch remote and fast-forward main and the
+#                                        permanent branches wherever they are checked out
 #   wt list [--json]                     list worktrees with status
 #   wt gitignore [--check]               sync the .gitignore rule for dir_prefix
 #   wt config                            show the resolved configuration
@@ -195,6 +203,7 @@ load_config() {
   NAME_NUMBER="${WT_NAME_NUMBER:-$(yml_get name_number "$cfg")}"
   COMMIT_PREFIX="${WT_COMMIT_PREFIX:-$(yml_get commit_prefix "$cfg")}"
   FORCE_WITH_LEASE="${WT_FORCE_WITH_LEASE:-$(yml_get force_with_lease "$cfg")}"
+  REMOTE_BRANCH_FMT="${WT_REMOTE_BRANCH:-$(yml_get remote_branch "$cfg")}"
   PORT_BASE_CFG="${WT_PORT_BASE_CFG:-$(yml_get port_base "$cfg")}"
   PORT_STRIDE="${WT_PORT_STRIDE:-$(yml_get port_stride "$cfg")}"
   POST_CREATE="${WT_POST_CREATE:-$(yml_cmd post_create "$cfg")}"
@@ -227,6 +236,12 @@ load_config() {
   else
     LINK_LIST="$(yml_list link "$cfg")"
   fi
+  if [ -n "${WT_PERMANENT+set}" ]; then
+    # shellcheck disable=SC2086  # deliberate split: WT_PERMANENT is space-separated
+    PERMANENT_LIST="$(printf '%s\n' ${WT_PERMANENT})"
+  else
+    PERMANENT_LIST="$(yml_list permanent "$cfg")"
+  fi
 
   [ -n "$base_repo" ] || die "wt.yml: 'base_repo' is required."
   : "${root:=.}"
@@ -237,6 +252,11 @@ load_config() {
   : "${NAME_NUMBER:=true}"
   : "${COMMIT_PREFIX:=wip}"
   : "${FORCE_WITH_LEASE:=false}"
+  [ -n "$REMOTE_BRANCH_FMT" ] || REMOTE_BRANCH_FMT='#{issue}-{slug}'
+  case "$REMOTE_BRANCH_FMT" in
+    *'{issue}'*) ;;
+    *) die "remote_branch must contain {issue}, got: $REMOTE_BRANCH_FMT" ;;
+  esac
   : "${PORT_STRIDE:=10}"
   case "$DIR_PREFIX" in
     */*) die "dir_prefix must not contain '/': $DIR_PREFIX" ;;
@@ -287,6 +307,7 @@ cmd_config() {
   printf 'name_number : %s\n' "$( [ "$NAME_NUMBER" -eq 1 ] && echo true || echo false )"
   printf 'commit_prefix: %s\n' "$COMMIT_PREFIX"
   printf 'force_with_lease: %s\n' "$( [ "$FORCE_WITH_LEASE" -eq 1 ] && echo true || echo false )"
+  printf 'remote_branch: %s\n' "$REMOTE_BRANCH_FMT"
   printf 'port_base   : %s\n' "${PORT_BASE_CFG:-(disabled)}"
   printf 'port_stride : %s\n' "$PORT_STRIDE"
   printf 'post_create : %s\n' "${POST_CREATE:-(none)}"
@@ -296,6 +317,33 @@ cmd_config() {
   printf 'active      : %s\n' "$(active_name || echo '(none)')"
   printf 'copy        : %s\n' "$(printf '%s' "$COPY_LIST" | tr '\n' ' ')"
   printf 'link        : %s\n' "$(printf '%s' "$LINK_LIST" | tr '\n' ' ')"
+  printf 'permanent   : %s\n' "$(printf '%s' "$PERMANENT_LIST" | tr '\n' ' ')"
+}
+
+# Permanent branches (main_branch plus the `permanent:` list) are long-lived:
+# `update` keeps them fast-forwarded, and delete / clean never remove them.
+is_permanent() {
+  [ "$1" = "$MAIN_BRANCH" ] && return 0
+  printf '%s\n' "$PERMANENT_LIST" | grep -qxF -- "$1"
+}
+
+# Whether everything on <branch> is already in <remote>/<main>: either it is an
+# ancestor (merge commit, fast-forward) or merging it would change nothing
+# (rebased or squash-merged). Needs git >= 2.38 for the second check; older git
+# only gets the first.
+contained_in_main() {
+  local b="$1" target="$REMOTE/$MAIN_BRANCH" tree
+  git_base merge-base --is-ancestor "$b" "$target" 2>/dev/null && return 0
+  tree="$(git_base merge-tree --write-tree "$target" "$b" 2>/dev/null | head -n1)" || return 1
+  [ -n "$tree" ] && [ "$tree" = "$(git_base rev-parse "$target^{tree}" 2>/dev/null)" ]
+}
+
+# Where a branch is checked out (base repo or a worktree); empty if nowhere.
+branch_checkout_path() {
+  git_base worktree list --porcelain | awk -v b="refs/heads/$1" '
+    /^worktree / { p = substr($0, 10); next }
+    /^branch /   { if (substr($0, 8) == b) { print p; exit } }
+  '
 }
 
 # ---- locking --------------------------------------------------------------
@@ -699,6 +747,104 @@ generate_name() {
   printf '%s%s-%s' "$prefix" "$((max + 1))" "$slug"
 }
 
+# ---- issue-named remote branches ------------------------------------------
+# A branch can carry an issue number (create/commit/push --issue). It only
+# changes the name the branch is pushed under: the local branch and the
+# worktree directory keep their <date>-N-<slug> name. The number lives in the
+# branch's own git config, so it goes away with the branch.
+normalize_issue() {
+  local n="${1#\#}"
+  case "$n" in
+    ''|*[!0-9]*) die "Issue must be a number like 12345 or #12345, got: '$1'" ;;
+  esac
+  printf '%s' "$n"
+}
+
+issue_get() { git_base config --get "branch.$1.wtissue" || true; }
+
+# The name <branch> gets on the remote for <issue>: remote_branch with {issue},
+# {slug} and {name} filled in. The slug is recorded by create; for a branch
+# that predates that, strip a leading <date>-N- if there is one.
+remote_branch_name() {
+  local b="$1" issue="$2" slug out k
+  slug="$(git_base config --get "branch.$b.wtslug" || true)"
+  if [ -z "$slug" ]; then
+    slug="$b"
+    if [[ "$b" =~ ^[0-9]+[-._][0-9]+[-._][0-9]+-[0-9]+-(.+)$ ]]; then
+      slug="${BASH_REMATCH[1]}"
+    fi
+  fi
+  out="$REMOTE_BRANCH_FMT"
+  k='{issue}'; out="${out//$k/$issue}"
+  k='{slug}';  out="${out//$k/$slug}"
+  k='{name}';  out="${out//$k/$b}"
+  printf '%s' "$out"
+}
+
+# Whether <commit> is, or once was, part of <branch>: reachable from its tip or
+# from an earlier tip in its reflog (what it pointed at before a rebase). This
+# is git's --force-if-includes, which cannot be used here because it looks for
+# a local branch named like the remote one, and an issue-named branch has none.
+branch_has_included() {
+  local path="$1" branch="$2" commit="$3" tip
+  while read -r tip; do
+    git -C "$path" merge-base --is-ancestor "$commit" "$tip" 2>/dev/null && return 0
+  done < <(git -C "$path" rev-parse "refs/heads/$branch"
+           git -C "$path" log -g --format=%H "refs/heads/$branch" 2>/dev/null)
+  return 1
+}
+
+# Push the branch checked out in a worktree and set its upstream. With an issue
+# number (passed now, or recorded earlier) it is pushed as remote_branch.
+# With <force> = 1 the remote branch is overwritten (after a rebase), but only
+# if it is still where we last saw it and that commit has been in this branch:
+# someone else's push, fetched or not, is never thrown away.
+push_worktree() {
+  local name="$1" path="$2" issue="$3" force="${4:-0}" branch target prev seen
+  local -a flags=()
+  branch="$(git -C "$path" symbolic-ref --quiet --short HEAD)" \
+    || die "Worktree '$name' is on a detached HEAD; nothing to push."
+  if [ "$force" -eq 1 ] && is_permanent "$branch"; then
+    die "'$branch' is a permanent branch; it is never force-pushed."
+  fi
+  # force_with_lease: true makes it the default, except for permanent branches.
+  if [ "$force" -eq 0 ] && [ "$FORCE_WITH_LEASE" -eq 1 ] && ! is_permanent "$branch"; then
+    force=1
+  fi
+  if [ -n "$issue" ]; then
+    is_permanent "$branch" \
+      && die "'$branch' is a permanent branch; it is always pushed under its own name."
+    git_base config "branch.$branch.wtissue" "$issue"
+  fi
+  issue="$(issue_get "$branch")"
+  target="$branch"
+  if [ -n "$issue" ]; then
+    target="$(remote_branch_name "$branch" "$issue")"
+    git check-ref-format "refs/heads/$target" \
+      || die "remote_branch gives an invalid branch name: '$target'"
+  fi
+  prev="$(git_base config --get "branch.$branch.merge" || true)"
+  prev="${prev#refs/heads/}"
+  if [ -n "$prev" ] && [ "$prev" != "$target" ]; then
+    warn "'$branch' was pushed as $REMOTE/$prev before; that branch stays. Remove it with: git -C $BASE_REPO push $REMOTE --delete '$prev'"
+  fi
+
+  # Nothing to overwrite on a first push, so it stays a plain one.
+  if [ "$force" -eq 1 ] \
+     && seen="$(git -C "$path" rev-parse --verify --quiet "refs/remotes/$REMOTE/$target")"; then
+    branch_has_included "$path" "$branch" "$seen" \
+      || die "$REMOTE/$target has commits that were never part of '$branch'; integrate them first (git -C $path rebase $REMOTE/$target), then push again."
+    flags=("--force-with-lease=refs/heads/$target:$seen")
+  fi
+
+  info "Pushing '$branch' to $REMOTE/$target ..."
+  if ! git -C "$path" push ${flags[@]+"${flags[@]}"} -u "$REMOTE" "$branch:refs/heads/$target" >&2; then
+    [ "$force" -eq 1 ] && die "Push to $REMOTE/$target was rejected: it has moved since the last fetch. Fetch and integrate it first."
+    die "Push to $REMOTE/$target was rejected. If you rebased, re-run with --force-with-lease; if $REMOTE/$target has new commits, integrate them first."
+  fi
+  ok "Pushed to $REMOTE/$target."
+}
+
 # ---- seeding new worktrees ------------------------------------------------
 # Resolve a copy:/link: entry to "source<TAB>destination".
 seed_paths() {
@@ -811,47 +957,66 @@ run_post_create() {
   return "$rc"
 }
 
-# Fetch origin and fast-forward the local main branch to origin/main.
-# Works even while main is checked out in the base repo, as long as it's clean.
+# Fetch origin and fast-forward main and every permanent branch to their
+# remote counterparts. A branch checked out somewhere (the base repo or a
+# worktree) is fast-forwarded in place, as long as that checkout is clean.
 update_main() {
   info "Fetching $REMOTE ..."
   git_base fetch --prune "$REMOTE"
 
-  local current
-  current="$(git_base rev-parse --abbrev-ref HEAD)"
+  ff_branch "$MAIN_BRANCH" 1
+  local b
+  while IFS= read -r b; do
+    [ -n "$b" ] && [ "$b" != "$MAIN_BRANCH" ] && ff_branch "$b" 0
+  done <<< "$PERMANENT_LIST"
+  return 0
+}
 
-  if [ "$current" = "$MAIN_BRANCH" ]; then
-    if [ -n "$(git_base status --porcelain)" ]; then
-      warn "Base repo working tree is dirty on $MAIN_BRANCH — skipping fast-forward."
-      return 0
-    fi
-    if git_base merge-base --is-ancestor "$REMOTE/$MAIN_BRANCH" "$MAIN_BRANCH"; then
-      ok "$MAIN_BRANCH already up to date."
+# Fast-forward local <branch> to <remote>/<branch>. A diverged main is fatal
+# (strict=1); a diverged permanent branch only warns.
+ff_branch() {
+  local b="$1" strict="$2" path
+  if ! git_base show-ref --verify --quiet "refs/remotes/$REMOTE/$b"; then
+    warn "$REMOTE/$b does not exist — skipping fast-forward of $b."
+    return 0
+  fi
+  path="$(branch_checkout_path "$b")"
+
+  if [ -z "$path" ]; then
+    # Not checked out anywhere; update the ref directly (only if it fast-forwards).
+    if git_base fetch "$REMOTE" "$b:$b" 2>/dev/null; then
+      ok "$b updated to $REMOTE/$b."
     else
-      if git_base merge --ff-only "$REMOTE/$MAIN_BRANCH" >&2; then
-        ok "$MAIN_BRANCH fast-forwarded to $REMOTE/$MAIN_BRANCH."
-      else
-        die "Cannot fast-forward $MAIN_BRANCH (diverged). Resolve manually in $BASE_REPO."
-      fi
+      warn "Could not fast-forward local $b; using $REMOTE/$b directly."
     fi
+    return 0
+  fi
+
+  if [ -n "$(git -C "$path" status --porcelain)" ]; then
+    warn "$path is dirty on $b — skipping fast-forward."
+    return 0
+  fi
+  if git -C "$path" merge-base --is-ancestor "$REMOTE/$b" "$b"; then
+    ok "$b already up to date."
+  elif git -C "$path" merge --ff-only "$REMOTE/$b" >&2; then
+    ok "$b fast-forwarded to $REMOTE/$b."
+  elif [ "$strict" -eq 1 ]; then
+    die "Cannot fast-forward $b (diverged). Resolve manually in $path."
   else
-    # main isn't checked out here; update the ref directly (only if it fast-forwards).
-    if git_base fetch "$REMOTE" "$MAIN_BRANCH:$MAIN_BRANCH" 2>/dev/null; then
-      ok "$MAIN_BRANCH updated to $REMOTE/$MAIN_BRANCH."
-    else
-      warn "Could not fast-forward local $MAIN_BRANCH (base repo is on '$current'); using $REMOTE/$MAIN_BRANCH directly."
-    fi
+    warn "Cannot fast-forward $b (diverged from $REMOTE/$b). Resolve manually in $path."
   fi
 }
 
 # ---- commands -------------------------------------------------------------
 cmd_create() {
-  local input="" from="" raw=0 hook=1 activate=0
+  local input="" from="" raw=0 hook=1 activate=0 issue=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --from|-b) from="${2:-}"; shift 2 ;;
       --from=*)  from="${1#*=}"; shift ;;
       --raw)     raw=1; shift ;;
+      --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
+      --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
       --no-hook) hook=0; shift ;;
       --activate) activate=1; shift ;;
       -*) die "Unknown flag for create: $1" ;;
@@ -892,6 +1057,13 @@ cmd_create() {
   info "Creating worktree '$name' from $base_ref ..."
   if git_base show-ref --verify --quiet "refs/heads/$name"; then
     # Branch already exists — check it out into the new worktree.
+    local elsewhere; elsewhere="$(branch_checkout_path "$name")"
+    if [ -n "$elsewhere" ]; then
+      if [ "$elsewhere" -ef "$BASE_REPO" ]; then
+        die "'$name' is checked out in the base repo. To give it its own worktree, detach the base first: git -C $BASE_REPO switch --detach"
+      fi
+      die "'$name' is already checked out in $elsewhere."
+    fi
     warn "Branch '$name' already exists; checking it out (ignoring --from)."
     git_base worktree add "$path" "$name" >&2
   else
@@ -899,6 +1071,11 @@ cmd_create() {
     # the worktree isn't misreported as "tracking main" and `git pull` here
     # doesn't pull main. First push should use `git push -u origin HEAD`.
     git_base worktree add --no-track -b "$name" "$path" "$base_ref" >&2
+    [ "$raw" -eq 1 ] || git_base config "branch.$name.wtslug" "$(slugify "$input")"
+  fi
+  if [ -n "$issue" ]; then
+    is_permanent "$name" && die "'$name' is a permanent branch; it can't take --issue."
+    git_base config "branch.$name.wtissue" "$issue"
   fi
 
   local idx port
@@ -923,6 +1100,7 @@ cmd_create() {
   else
     ok "Worktree ready: $path  (branch: $name, index: $idx)"
   fi
+  [ -z "$issue" ] || info "Will be pushed as $REMOTE/$(remote_branch_name "$name" "$issue")."
 
   local rc=0
   if [ "$hook" -eq 1 ]; then run_post_create "$name" "$path" || rc=$?; fi
@@ -970,6 +1148,10 @@ cmd_delete() {
                                } }
               ')"
 
+  if [ -n "$branch" ] && is_permanent "$branch"; then
+    die "'$branch' is a permanent worktree. Remove it from 'permanent:' in $WT_CONFIG_FILE first, or use: git -C $BASE_REPO worktree remove $path"
+  fi
+
   info "Removing worktree $path ..."
   if [ "$force" -eq 1 ]; then
     git_base worktree remove --force "$path" >&2
@@ -989,7 +1171,13 @@ cmd_delete() {
   fi
 
   if [ -n "$branch" ] && [ "$branch" != "$MAIN_BRANCH" ] && [ "$keep_branch" -eq 0 ]; then
-    if git_base branch -d "$branch" >/dev/null 2>&1; then
+    # `branch -d` only knows ancestry against HEAD or the upstream, so it keeps
+    # rebased and squash-merged branches (and everything, once the base repo is
+    # detached). Check against main ourselves first.
+    if contained_in_main "$branch"; then
+      git_base branch -D "$branch" >/dev/null
+      ok "Branch '$branch' deleted (contained in $REMOTE/$MAIN_BRANCH)."
+    elif git_base branch -d "$branch" >/dev/null 2>&1; then
       ok "Branch '$branch' deleted."
     else
       warn "Branch '$branch' not fully merged; kept. Delete with: git -C $BASE_REPO branch -D $branch"
@@ -1021,10 +1209,10 @@ cmd_clean() {
   local skipped=0 line path branch reason
   while IFS=$'\t' read -r path branch; do
     [ -n "$path" ] || continue
-    [ "$branch" = "$MAIN_BRANCH" ] && continue
+    is_permanent "$branch" && continue
     [ "$branch" = "(detached)" ] && continue
     reason=""
-    if [ "$merged" -eq 1 ] && git_base merge-base --is-ancestor "$branch" "$REMOTE/$MAIN_BRANCH" 2>/dev/null; then
+    if [ "$merged" -eq 1 ] && contained_in_main "$branch"; then
       reason="merged into $MAIN_BRANCH"
     fi
     if [ -z "$reason" ] && [ "$gone" -eq 1 ]; then
@@ -1114,6 +1302,10 @@ cmd_rebase() {
   info "Rebasing '$name' onto $target ..."
   if git -C "$path" rebase "$target" >&2; then
     ok "Rebased '$name' onto $target."
+    if git -C "$path" rev-parse --verify --quiet '@{upstream}' >/dev/null 2>&1 \
+       && ! git -C "$path" merge-base --is-ancestor '@{upstream}' HEAD; then
+      info "Already pushed; update the remote branch with: wt push $name --force-with-lease"
+    fi
   else
     warn "Rebase hit conflicts. Resolve in $path, then: git -C $path rebase --continue"
     warn "Or abort with: git -C $path rebase --abort"
@@ -1122,16 +1314,21 @@ cmd_rebase() {
 }
 
 cmd_commit() {
-  local name="" msg="" push=0
+  local name="" msg="" push=0 issue="" force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --push|-p) push=1; shift ;;
+      --force-with-lease) force=1; shift ;;
+      --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
+      --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
       -m) msg="${2:-}"; shift 2 ;;
       -*) die "Unknown flag for commit: $1" ;;
       *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
     esac
   done
   require_name "$name"
+  [ -z "$issue" ] || [ "$push" -eq 1 ] || die "--issue names the pushed branch; use it with --push."
+  [ "$force" -eq 0 ] || [ "$push" -eq 1 ] || die "--force-with-lease is about pushing; use it with --push."
   local path; path="$(find_wt_path "$name")"
   [ -d "$path" ] || die "No worktree at $path"
 
@@ -1146,15 +1343,24 @@ cmd_commit() {
     ok "Committed: $msg"
   fi
 
-  if [ "$push" -eq 1 ]; then
-    # --force-with-lease lets a rebased branch through, but still refuses if the
-    # remote moved since our last fetch (someone else pushed to it).
-    local -a push_args=(-u)
-    [ "$FORCE_WITH_LEASE" -eq 1 ] && push_args+=(--force-with-lease)
-    info "Pushing '$name' to $REMOTE ..."
-    git -C "$path" push "${push_args[@]}" "$REMOTE" HEAD >&2
-    ok "Pushed."
-  fi
+  if [ "$push" -eq 1 ]; then push_worktree "$name" "$path" "$issue" "$force"; fi
+}
+
+cmd_push() {
+  local name="" issue="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
+      --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
+      --force-with-lease) force=1; shift ;;
+      -*) die "Unknown flag for push: $1" ;;
+      *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  require_name "$name"
+  local path; path="$(find_wt_path "$name")"
+  [ -d "$path" ] || die "No worktree at $path"
+  push_worktree "$name" "$path" "$issue" "$force"
 }
 
 cmd_path() {
@@ -1299,6 +1505,7 @@ case "$cmd" in
   clean) cmd_clean "$@" ;;
   rebase) cmd_rebase "$@" ;;
   commit) cmd_commit "$@" ;;
+  push) cmd_push "$@" ;;
   exec) cmd_exec "$@" ;;
   each) cmd_each "$@" ;;
   path) cmd_path "$@" ;;

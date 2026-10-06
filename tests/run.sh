@@ -22,9 +22,9 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_TERMINAL_PROMPT=0
 export NO_COLOR=1
 unset WT_CONFIG WT_BASE_REPO WT_WORKTREE_ROOT WT_DIR_PREFIX WT_MAIN_BRANCH \
-      WT_REMOTE WT_DATE_FORMAT WT_COMMIT_PREFIX WT_PORT_BASE_CFG WT_PORT_STRIDE \
+      WT_REMOTE WT_REMOTE_BRANCH WT_DATE_FORMAT WT_COMMIT_PREFIX WT_PORT_BASE_CFG WT_PORT_STRIDE \
       WT_POST_CREATE WT_PRE_ACTIVATE WT_POST_ACTIVATE WT_ACTIVE_LINK \
-      WT_MANAGE_GITIGNORE WT_COPY WT_LINK WT_LOCK_TIMEOUT 2>/dev/null || true
+      WT_MANAGE_GITIGNORE WT_COPY WT_LINK WT_PERMANENT WT_LOCK_TIMEOUT 2>/dev/null || true
 
 default_jobs() {
   local n
@@ -74,16 +74,23 @@ run_test() {
   local tmp log
   tmp="$(mktemp -d "$tmpdir_root/wt-test.XXXXXX")"
   log="$WORK/$slot.log"
-  if (
-      set -e
-      export TEST_TMP="$tmp"
-      # shellcheck source=helpers.sh
-      . "$DIR/helpers.sh"
-      # shellcheck source=/dev/null
-      . "$file"
-      fixture
-      "$fn"
-     ) >"$log" 2>&1 </dev/null; then
+  # A plain statement, not `if ( ... )` or `( ... ) || rc=$?`: bash ignores
+  # set -e inside an if condition or on the left of || / &&, so a failing
+  # assertion mid-test would not stop it and only its last command would
+  # decide the verdict. run.sh itself has no set -e, so this can't abort it.
+  local rc
+  (
+    set -e
+    export TEST_TMP="$tmp"
+    # shellcheck source=helpers.sh
+    . "$DIR/helpers.sh"
+    # shellcheck source=/dev/null
+    . "$file"
+    fixture
+    "$fn"
+  ) >"$log" 2>&1 </dev/null
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
     printf 'ok %s\n' "$name" > "$WORK/$slot.result"
   else
     printf 'fail %s\n' "$name" > "$WORK/$slot.result"

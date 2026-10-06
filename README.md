@@ -48,7 +48,8 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `date_format` | `strftime` format for the date in auto-named branches | `%d-%m-%Y` |
 | `name_date` / `name_number` | Include the date / the sequence number in auto-names — see [Naming](#naming) | `true` / `true` |
 | `commit_prefix` | Prefix for `wt commit`'s default message | `wip` |
-| `force_with_lease` | Make every `wt commit --push` a `--force-with-lease` push, so a rebased branch goes through | `false` |
+| `remote_branch` | Name of the pushed branch once it has an issue number — see [Issue numbers](#issue-numbers) | `"#{issue}-{slug}"` |
+| `force_with_lease` | Make every push a `--force-with-lease` push (as if the flag were passed), so a rebased branch goes through; permanent branches excepted | `false` |
 | `copy` / `link` | Ignored files each worktree needs (`.env`, `.venv`) — see [Parallel worktrees](#parallel-worktrees-and-agents) | — |
 | `port_base` / `port_stride` | Give each worktree its own port range | off / `10` |
 | `post_create` | Command to run in a freshly created worktree | — |
@@ -87,7 +88,8 @@ date_format: "%d-%m-%Y"        # date prefix for auto-named branches (strftime)
 name_date: true                # include the date in auto-names
 name_number: true              # include the sequence number in auto-names
 commit_prefix: wip             # default `wt commit` message prefix
-force_with_lease: false        # push with --force-with-lease (after rebases)
+remote_branch: "#{issue}-{slug}"   # branch name on the remote, given an issue number
+force_with_lease: false        # push with --force-with-lease by default (after rebases)
 
 port_base: 8000                # worktree N gets ports 8000 + N*port_stride
 port_stride: 10
@@ -97,15 +99,17 @@ copy:                          # seeded per worktree (ignored files git won't br
   - .claude/settings.local.json
 link:                          # shared with the base repo via symlink
   - .venv
+permanent:                     # long-lived branches, see "Permanent worktrees"
+  - production
 ```
 
 Every key can also be overridden per-run by its matching env var:
 `WT_BASE_REPO`, `WT_WORKTREE_ROOT`, `WT_DIR_PREFIX`, `WT_MANAGE_GITIGNORE`,
-`WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_DATE_FORMAT`, `WT_NAME_DATE`,
+`WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_REMOTE_BRANCH`, `WT_DATE_FORMAT`, `WT_NAME_DATE`,
 `WT_NAME_NUMBER`, `WT_COMMIT_PREFIX`, `WT_FORCE_WITH_LEASE`,
 `WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_ACTIVE_LINK`,
-`WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK`
-(space-separated). Run `./wt config` to print the resolved settings.
+`WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK` /
+`WT_PERMANENT` (space-separated). Run `./wt config` to print the resolved settings.
 
 The three command keys (`post_create`, `pre_activate`, `post_activate`) accept a
 YAML block scalar, so a multi-line hook doesn't have to be crammed onto one line:
@@ -134,15 +138,19 @@ Run from inside `wt-shallowflaws/`:
 | `./wt create <slug>` | Fetch origin, fast-forward `main`, then create a worktree in **`wt-DD-MM-YYYY-N-<slug>/`** on a new branch **`DD-MM-YYYY-N-<slug>`** off **latest main**. |
 | `./wt create <slug> --from <branch>` | Same, but branch off `<branch>` (local or `origin/<branch>`) instead of `main`. |
 | `./wt create <name> --raw` | Skip auto-naming and use `<name>` verbatim as the branch/worktree name. |
+| `./wt create <slug> --issue 12345` | Same as `create`, and remember the issue: the branch is pushed as **`#12345-<slug>`**. |
 | `./wt rebase <name>` | Update `main`, then rebase the worktree's branch onto **latest `origin/main`**. |
 | `./wt rebase <name> --onto <branch>` | Rebase onto another branch instead of `main`. |
 | `./wt commit <name>` | Stage **all** changes in the worktree and commit with a generic message (`wip: DD-MM-YYYY HH:MM`). |
 | `./wt commit <name> -m "msg"` | Same, but with your own commit message. |
-| `./wt commit <name> --push` | Commit, then `git push -u origin HEAD` (creates the remote branch on first push). With `force_with_lease: true` it is `git push --force-with-lease`, so a branch you rebased can be pushed. |
-| `./wt delete <name>` | Remove the worktree and delete its branch (only if fully merged). |
+| `./wt commit <name> --push` | Commit, then push and set the upstream (creates the remote branch on first push). |
+| `./wt push <name>` | Push the worktree's branch and set its upstream, without committing. |
+| `./wt push <name> --issue 12345` | Push it as **`#12345-<slug>`** (also `commit --push --issue`). The number is remembered. |
+| `./wt push <name> --force-with-lease` | Overwrite the remote branch after a rebase (also `commit --push --force-with-lease`) — see [Behavior notes](#behavior-notes). `force_with_lease: true` makes this the default. |
+| `./wt delete <name>` | Remove the worktree and delete its branch (only if it is contained in `origin/main`). |
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
-| `./wt clean --merged` | Remove every worktree whose branch is merged into `main` (asks first). |
+| `./wt clean --merged` | Remove every worktree whose branch is contained in `main`, however it was merged (asks first). |
 | `./wt clean --gone` | Same, for branches whose remote was deleted — catches squash-merged PRs. |
 | `./wt clean --merged --dry-run` | List what would be removed. Add `--yes` to skip the prompt. |
 | `./wt activate <name>` | Make it the active worktree: run `pre_activate`, repoint `active_link`, run `post_activate`. |
@@ -153,11 +161,39 @@ Run from inside `wt-shallowflaws/`:
 | `./wt each -- <cmd>` | Run a command inside every worktree (`--keep-going` to not stop at the first failure). |
 | `./wt list --json` | Same as `list`, as JSON — for scripts and orchestrators. |
 | `./wt config` | Print the resolved configuration (which `wt.yml`, paths, etc). |
-| `./wt update` | Just fetch origin and fast-forward `main` in the base repo. |
+| `./wt update` | Just fetch origin and fast-forward `main` and the [permanent](#permanent-worktrees) branches, wherever they are checked out. |
 | `./wt list` | List worktrees with index, ports, dirty flag and ahead/behind `main`. |
 | `./wt gitignore` | Rewrite the managed `.gitignore` block to match `dir_prefix`. |
 | `./wt gitignore --check` | Report whether it is up to date; exits non-zero if not (for CI / hooks). |
 | `./wt help` | Show usage. |
+
+## Issue numbers
+
+The local branch and the worktree directory always keep the `DD-MM-YYYY-N-<slug>`
+name. Give a branch an issue number and it is pushed under a different name,
+`#<issue>-<slug>` by default:
+
+```bash
+./wt create "add search" --issue 12345     # local: 10-09-2026-1-add-search
+./wt commit 10-09-2026-1-add-search --push # remote: origin/#12345-add-search
+
+# or decide at push time; "#12345" works too (quote it)
+./wt push 10-09-2026-1-add-search --issue 12345
+```
+
+- The number is stored in the branch's git config (`branch.<name>.wtissue`), so
+  later pushes need no flag and it is gone when the branch is deleted.
+- The remote name comes from **`remote_branch`**, with `{issue}`, `{slug}` and
+  `{name}` (the full local branch name) filled in, e.g.
+  `remote_branch: "app#{issue}-{slug}"`. Quote the value: YAML and `wt` both
+  read an unquoted `#` as the start of a comment.
+- The upstream is set to the issue-named branch, so `git pull`, `git status` and
+  `wt clean --gone` follow it. A bare **`git push` is refused by git** because
+  the names differ (`push.default=simple`) — push with `./wt push <name>`, or
+  `git push origin HEAD:<remote name>`.
+- Pushing with a different issue number creates a second remote branch; `wt`
+  prints the command to delete the old one.
+- Without an issue number nothing changes: the branch is pushed under its own name.
 
 ## Naming
 
@@ -359,11 +395,47 @@ Agent workflows generate a lot of dead worktrees:
 ./wt clean --merged --gone --yes       # remove it
 ```
 
-`--merged` catches branches merged into `main`; `--gone` catches branches whose
-remote was deleted, which is how a squash-merged PR looks locally. Worktrees
+`--merged` catches branches contained in `origin/main`: merged with a merge
+commit, or rebased or squashed so that merging them again would change nothing
+(the last two need git 2.38+). `--gone` catches branches whose remote was
+deleted. `delete` uses the same check to decide whether the branch can go too;
+a branch with changes that aren't on `main` is always kept. Worktrees
 with uncommitted changes are always skipped and reported. On a terminal `clean`
 lists what it will remove and asks for confirmation; with no terminal (a script,
 CI, an agent) it refuses to proceed unless you pass `--yes`.
+
+### Permanent worktrees
+
+Some branches deserve a checkout that never goes away — `production`, say, to
+reproduce a bug against what is deployed. List them under `permanent:` and
+create each once with `--raw`:
+
+```yaml
+permanent:
+  - production
+```
+
+```bash
+./wt create production --raw
+```
+
+A permanent worktree:
+
+- is never removed by `clean`, and `delete` refuses it (take it off the list first);
+- is fast-forwarded to `origin/<branch>` by every `create`, `rebase`, `clean`
+  and `update` — unless it has uncommitted changes, or has diverged, in which
+  case `wt` warns and leaves it alone.
+
+`main_branch` is always permanent. It is normally checked out in the base repo,
+and git allows a branch in only one checkout, so to give `main` its own worktree
+too, detach the base repo first:
+
+```bash
+git -C ../shallowflaws switch --detach
+./wt create main --raw
+```
+
+The base repo then just holds the shared `.git`; `wt` keeps working from it.
 
 ### One file wt writes outside the worktrees
 
@@ -520,11 +592,15 @@ done
   fast-forward is skipped with a warning rather than clobbering your work.
 - **New branch name = worktree directory name**, minus `dir_prefix`. If a
   branch with that name already exists, it is checked out instead of erroring.
-- **Pushing after a rebase** is rejected as non-fast-forward unless
-  `force_with_lease: true`. The lease still refuses if the remote branch moved
-  since your last fetch, so it won't overwrite someone else's push.
 - **Rebase refuses on uncommitted changes**, and on conflict prints the exact
   `git rebase --continue` / `--abort` commands to run.
+- **Rebase never pushes.** A branch that was already pushed needs
+  `./wt push <name> --force-with-lease` afterwards; `rebase` says so when that
+  is the case. The push is refused if the remote branch has moved since you
+  last fetched it, or holds commits that were never part of your branch, so a
+  teammate's push is not overwritten. With `force_with_lease: true` every
+  push behaves this way without the flag. Permanent branches are never
+  force-pushed, and a first push stays a plain push.
 - **Delete only removes merged branches** automatically; an unmerged branch is
   kept and the `git branch -D` command to force-delete it is printed.
 - **Indices are recycled.** Deleting worktree 2 frees index 2 (and ports 8020+)
@@ -584,7 +660,7 @@ test_create_makes_prefixed_dir_and_bare_branch() {
 
 Config parsing, naming and prefixes, the generated `.gitignore`, seeding,
 indices and ports, `post_create`, activation and its hooks, `list`/`path`/
-`exec`/`each`, `delete`/`clean`/`rebase`/`commit`, concurrent `create`, and
+`exec`/`each`, `delete`/`clean`/`rebase`/`commit`/`push`, concurrent `create`, and
 awkward layouts (paths with spaces, symlinked roots, legacy unprefixed
 directories). Every bug found while building `wt` has a regression test — each
 is commented with the failure it locks down, so the reason it exists survives.
@@ -612,3 +688,20 @@ alias wt='/Users/kaarlekulvik/Projects/wt-shallowflaws/wt'
 ```
 
 Then `wt create ...` works from any directory.
+
+## Optional: a repo's Claude Code skill in this folder
+
+If the managed repo ships a Claude Code skill for `wt` (e.g. `/worktree` in
+`.claude/skills/worktree/`), Claude only loads it in sessions started inside
+that repo's checkouts. To use it in a session opened on this folder too, link it
+from a [permanent](#permanent-worktrees) worktree of the main branch:
+
+```bash
+mkdir -p .claude/skills
+ln -s ../../wt-main/.claude/skills/worktree .claude/skills/worktree
+```
+
+The link is relative, so it survives moving the parent directory, and it follows
+whatever `wt-main` holds, which `wt` keeps fast-forwarded. `/.claude/skills/` is
+in `.gitignore`, so the link stays local to your install. Start a new Claude
+session afterwards; skills are read when a session starts.

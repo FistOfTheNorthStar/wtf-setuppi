@@ -204,3 +204,78 @@ test_rebase_moves_the_branch_onto_new_main() {
   assert_ok
   assert_contains "$(git -C "$p" log --pretty=%s)" "main moves on"
 }
+
+# Land <branch> on the remote main the way an MR does: as new commits (rebase,
+# squash), so the branch itself is never an ancestor of main, or as a merge
+# commit (merge).
+#   land_on_main <branch> rebase|squash|merge
+land_on_main() {
+  local clone="$TEST_TMP/lander"
+  git clone -q "$TEST_TMP/remote" "$clone" 2>/dev/null
+  git -C "$clone" fetch -q "$TEST_TMP/base" "$1"
+  echo other > "$clone/other.txt"          # main moves on meanwhile
+  git -C "$clone" add -A
+  git -C "$clone" -c user.email=t@e -c user.name=t commit -qm other
+  local id=(-c user.email=t@e -c user.name=t)
+  case "$2" in
+    squash) git -C "$clone" "${id[@]}" merge -q --squash FETCH_HEAD >/dev/null
+            git -C "$clone" "${id[@]}" commit -qm squashed ;;
+    merge)  git -C "$clone" "${id[@]}" merge -q --no-ff -m merged FETCH_HEAD ;;
+    *)      git -C "$clone" "${id[@]}" cherry-pick "main..FETCH_HEAD" >/dev/null ;;
+  esac
+  git -C "$clone" push -q origin main
+  base_git fetch -q origin
+}
+
+test_delete_removes_a_rebase_merged_branch() {
+  local p; p="$(wt create one 2>/dev/null)"
+  echo a > "$p/a.txt"; wt commit "$(name_n 1 one)" -m a >/dev/null 2>&1
+  land_on_main "$(name_n 1 one)" rebase
+  run wt delete "$(name_n 1 one)"
+  assert_ok
+  assert_contains "$stderr" "contained in origin/main"
+  assert_branch_gone "$(name_n 1 one)"
+}
+
+test_delete_removes_a_squash_merged_branch() {
+  local p; p="$(wt create one 2>/dev/null)"
+  echo a > "$p/a.txt"; wt commit "$(name_n 1 one)" -m a >/dev/null 2>&1
+  echo b > "$p/b.txt"; wt commit "$(name_n 1 one)" -m b >/dev/null 2>&1
+  land_on_main "$(name_n 1 one)" squash
+  run wt delete "$(name_n 1 one)"
+  assert_ok
+  assert_branch_gone "$(name_n 1 one)"
+}
+
+test_delete_removes_a_merged_branch_while_the_base_is_detached() {
+  # Without an upstream, branch -d compares with HEAD, which a detached base
+  # leaves behind; even a plain merge commit looked "not fully merged".
+  base_git switch -q --detach
+  local p; p="$(wt create one 2>/dev/null)"
+  echo a > "$p/a.txt"; wt commit "$(name_n 1 one)" -m a >/dev/null 2>&1
+  land_on_main "$(name_n 1 one)" merge
+  run wt delete "$(name_n 1 one)"
+  assert_ok
+  assert_branch_gone "$(name_n 1 one)"
+}
+
+test_delete_keeps_a_branch_with_changes_not_on_main() {
+  local p; p="$(wt create one 2>/dev/null)"
+  echo a > "$p/a.txt"; wt commit "$(name_n 1 one)" -m a >/dev/null 2>&1
+  land_on_main "$(name_n 1 one)" rebase
+  echo more > "$p/more.txt"; wt commit "$(name_n 1 one)" -m more >/dev/null 2>&1
+  run wt delete "$(name_n 1 one)"
+  assert_ok
+  assert_contains "$stderr" "not fully merged"
+  assert_branch_exists "$(name_n 1 one)"
+}
+
+test_clean_merged_catches_a_rebase_merged_branch() {
+  local p; p="$(wt create one 2>/dev/null)"
+  echo a > "$p/a.txt"; wt commit "$(name_n 1 one)" -m a >/dev/null 2>&1
+  land_on_main "$(name_n 1 one)" rebase
+  run wt clean --merged --yes
+  assert_ok
+  assert_no_file "$p"
+  assert_branch_gone "$(name_n 1 one)"
+}
