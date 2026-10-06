@@ -46,8 +46,10 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `main_branch` | The base branch, if it isn't `main` (e.g. `master`) | `main` |
 | `remote` | The remote to fetch/push, if it isn't `origin` | `origin` |
 | `date_format` | `strftime` format for the date in auto-named branches | `%d-%m-%Y` |
+| `name_date` / `name_number` | Include the date / the sequence number in auto-names — see [Naming](#naming) | `true` / `true` |
 | `commit_prefix` | Prefix for `wt commit`'s default message | `wip` |
 | `remote_branch` | Name of the pushed branch once it has an issue number — see [Issue numbers](#issue-numbers) | `"#{issue}-{slug}"` |
+| `force_with_lease` | Make every push a `--force-with-lease` push (as if the flag were passed), so a rebased branch goes through; permanent branches excepted | `false` |
 | `copy` / `link` | Ignored files each worktree needs (`.env`, `.venv`) — see [Parallel worktrees](#parallel-worktrees-and-agents) | — |
 | `port_base` / `port_stride` | Give each worktree its own port range | off / `10` |
 | `post_create` | Command to run in a freshly created worktree | — |
@@ -83,8 +85,11 @@ manage_gitignore: true         # keep the dir_prefix rule in .gitignore up to da
 main_branch: main              # base branch, always pulled to latest
 remote: origin                 # git remote to fetch/push
 date_format: "%d-%m-%Y"        # date prefix for auto-named branches (strftime)
+name_date: true                # include the date in auto-names
+name_number: true              # include the sequence number in auto-names
 commit_prefix: wip             # default `wt commit` message prefix
 remote_branch: "#{issue}-{slug}"   # branch name on the remote, given an issue number
+force_with_lease: false        # push with --force-with-lease by default (after rebases)
 
 port_base: 8000                # worktree N gets ports 8000 + N*port_stride
 port_stride: 10
@@ -100,7 +105,8 @@ permanent:                     # long-lived branches, see "Permanent worktrees"
 
 Every key can also be overridden per-run by its matching env var:
 `WT_BASE_REPO`, `WT_WORKTREE_ROOT`, `WT_DIR_PREFIX`, `WT_MANAGE_GITIGNORE`,
-`WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_REMOTE_BRANCH`, `WT_DATE_FORMAT`, `WT_COMMIT_PREFIX`,
+`WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_REMOTE_BRANCH`, `WT_DATE_FORMAT`, `WT_NAME_DATE`,
+`WT_NAME_NUMBER`, `WT_COMMIT_PREFIX`, `WT_FORCE_WITH_LEASE`,
 `WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_ACTIVE_LINK`,
 `WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK` /
 `WT_PERMANENT` (space-separated). Run `./wt config` to print the resolved settings.
@@ -140,7 +146,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt commit <name> --push` | Commit, then push and set the upstream (creates the remote branch on first push). |
 | `./wt push <name>` | Push the worktree's branch and set its upstream, without committing. |
 | `./wt push <name> --issue 12345` | Push it as **`#12345-<slug>`** (also `commit --push --issue`). The number is remembered. |
-| `./wt push <name> --force-with-lease` | Overwrite the remote branch after a rebase (also `commit --push --force-with-lease`) — see [Behavior notes](#behavior-notes). |
+| `./wt push <name> --force-with-lease` | Overwrite the remote branch after a rebase (also `commit --push --force-with-lease`) — see [Behavior notes](#behavior-notes). `force_with_lease: true` makes this the default. |
 | `./wt delete <name>` | Remove the worktree and delete its branch (only if it is contained in `origin/main`). |
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
@@ -199,6 +205,22 @@ name. Give a branch an issue number and it is pushed under a different name,
   branches *and* worktree dirs, so gaps from deletions don't reuse a number).
 - **`slug`** — your text, lowercased with non-alphanumerics collapsed to dashes
   (`"Add Search!"` → `add-search`).
+
+Either part can be switched off in `wt.yml` (or with `WT_NAME_DATE` /
+`WT_NAME_NUMBER`):
+
+| `name_date` | `name_number` | `./wt create "add search"` → branch |
+|---|---|---|
+| `true` | `true` | `10-09-2026-1-add-search` (default) |
+| `false` | `true` | `1-add-search` |
+| `true` | `false` | `10-09-2026-add-search` |
+| `false` | `false` | `add-search` |
+
+Without the date, `N` is a running counter across every `<N>-<slug>` name
+rather than a per-day one. Without the number, creating the same slug twice
+(on the same day, if the date is on) hits the existing branch — it is checked
+out, as with `--raw` — or fails if its worktree directory still exists.
+`dir_prefix` is applied on top either way (`wt-add-search/`).
 
 Pass `--raw` to bypass this and name the branch exactly what you type.
 
@@ -576,8 +598,9 @@ done
   `./wt push <name> --force-with-lease` afterwards; `rebase` says so when that
   is the case. The push is refused if the remote branch has moved since you
   last fetched it, or holds commits that were never part of your branch, so a
-  teammate's push is not overwritten. Permanent
-  branches are never force-pushed, and a first push stays a plain push.
+  teammate's push is not overwritten. With `force_with_lease: true` every
+  push behaves this way without the flag. Permanent branches are never
+  force-pushed, and a first push stays a plain push.
 - **Delete only removes merged branches** automatically; an unmerged branch is
   kept and the `git branch -D` command to force-delete it is printed.
 - **Indices are recycled.** Deleting worktree 2 frees index 2 (and ports 8020+)
@@ -596,7 +619,7 @@ done
 ./tests/run.sh --no-lint      # skip shellcheck
 ```
 
-104 tests, ~15s. No dependencies beyond bash and git — no bats, no npm.
+112 tests, ~15s. No dependencies beyond bash and git — no bats, no npm.
 
 Each test runs in its own subshell with `set -e` (so the first failed assertion
 ends that test) against its own throwaway git repos under `$TMPDIR`: a bare

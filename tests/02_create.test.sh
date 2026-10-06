@@ -77,3 +77,42 @@ test_empty_dir_prefix_creates_unprefixed_dirs() {
   assert_ok
   assert_dir "$TEST_TMP/host/$(name_n 1 plain)"
 }
+
+test_name_date_false_drops_the_date() {
+  run wtenv WT_NAME_DATE=false -- create "add search"
+  assert_ok
+  assert_eq "$stdout" "$TEST_TMP/host/wt-1-add-search" "stdout"
+  assert_branch_exists "1-add-search"
+}
+
+test_name_date_false_still_counts_up() {
+  wtenv WT_NAME_DATE=false -- create one >/dev/null 2>&1
+  run wtenv WT_NAME_DATE=false -- create two
+  assert_eq "$stdout" "$TEST_TMP/host/wt-2-two" "stdout"
+}
+
+test_name_number_false_drops_the_number() {
+  config_add <<'YML'
+name_number: false
+YML
+  run wt create "add search"
+  assert_ok
+  assert_eq "$stdout" "$TEST_TMP/host/wt-$TODAY-add-search" "stdout"
+}
+
+test_both_off_uses_just_the_slug() {
+  config_add <<'YML'
+name_date: false
+name_number: false
+YML
+  run wt create "Add Search!"
+  assert_ok
+  assert_eq "$stdout" "$TEST_TMP/host/wt-add-search" "stdout"
+  assert_branch_exists "add-search"
+}
+
+test_bad_name_date_is_rejected() {
+  run wtenv WT_NAME_DATE=maybe -- create thing
+  assert_fails
+  assert_contains "$stderr" "name_date must be true or false"
+}
