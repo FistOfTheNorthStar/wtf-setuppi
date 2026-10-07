@@ -49,7 +49,7 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `name_date` / `name_number` | Include the date / the sequence number in auto-names — see [Naming](#naming) | `true` / `true` |
 | `commit_prefix` | Prefix for `wt commit`'s default message | `wip` |
 | `remote_branch` | Name of the pushed branch once it has an issue number — see [Issue numbers](#issue-numbers) | `"#{issue}-{slug}"` |
-| `force_with_lease` | Make every push a `--force-with-lease` push (as if the flag were passed), so a rebased branch goes through; permanent branches excepted | `false` |
+| `force_with_lease` | Make every push a `--force-with-lease` push (as if the flag were passed), so a rebased branch goes through | `false` |
 | `copy` / `link` | Ignored files each worktree needs (`.env`, `.venv`) — see [Parallel worktrees](#parallel-worktrees-and-agents) | — |
 | `port_base` / `port_stride` | Give each worktree its own port range | off / `10` |
 | `post_create` | Command to run in a freshly created worktree | — |
@@ -99,8 +99,6 @@ copy:                          # seeded per worktree (ignored files git won't br
   - .claude/settings.local.json
 link:                          # shared with the base repo via symlink
   - .venv
-permanent:                     # long-lived branches, see "Permanent worktrees"
-  - production
 ```
 
 Every key can also be overridden per-run by its matching env var:
@@ -108,8 +106,8 @@ Every key can also be overridden per-run by its matching env var:
 `WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_REMOTE_BRANCH`, `WT_DATE_FORMAT`, `WT_NAME_DATE`,
 `WT_NAME_NUMBER`, `WT_COMMIT_PREFIX`, `WT_FORCE_WITH_LEASE`,
 `WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_ACTIVE_LINK`,
-`WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK` /
-`WT_PERMANENT` (space-separated). Run `./wt config` to print the resolved settings.
+`WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK`
+(space-separated). Run `./wt config` to print the resolved settings.
 
 The three command keys (`post_create`, `pre_activate`, `post_activate`) accept a
 YAML block scalar, so a multi-line hook doesn't have to be crammed onto one line:
@@ -161,7 +159,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt each -- <cmd>` | Run a command inside every worktree (`--keep-going` to not stop at the first failure). |
 | `./wt list --json` | Same as `list`, as JSON — for scripts and orchestrators. |
 | `./wt config` | Print the resolved configuration (which `wt.yml`, paths, etc). |
-| `./wt update` | Just fetch origin and fast-forward `main` and the [permanent](#permanent-worktrees) branches, wherever they are checked out. |
+| `./wt update` | Just fetch origin and fast-forward `main`, wherever it is checked out. |
 | `./wt list` | List worktrees with index, ports, dirty flag and ahead/behind `main`. |
 | `./wt gitignore` | Rewrite the managed `.gitignore` block to match `dir_prefix`. |
 | `./wt gitignore --check` | Report whether it is up to date; exits non-zero if not (for CI / hooks). |
@@ -404,39 +402,6 @@ with uncommitted changes are always skipped and reported. On a terminal `clean`
 lists what it will remove and asks for confirmation; with no terminal (a script,
 CI, an agent) it refuses to proceed unless you pass `--yes`.
 
-### Permanent worktrees
-
-Some branches deserve a checkout that never goes away — `production`, say, to
-reproduce a bug against what is deployed. List them under `permanent:` and
-create each once with `--raw`:
-
-```yaml
-permanent:
-  - production
-```
-
-```bash
-./wt create production --raw
-```
-
-A permanent worktree:
-
-- is never removed by `clean`, and `delete` refuses it (take it off the list first);
-- is fast-forwarded to `origin/<branch>` by every `create`, `rebase`, `clean`
-  and `update` — unless it has uncommitted changes, or has diverged, in which
-  case `wt` warns and leaves it alone.
-
-`main_branch` is always permanent. It is normally checked out in the base repo,
-and git allows a branch in only one checkout, so to give `main` its own worktree
-too, detach the base repo first:
-
-```bash
-git -C ../shallowflaws switch --detach
-./wt create main --raw
-```
-
-The base repo then just holds the shared `.git`; `wt` keeps working from it.
-
 ### One file wt writes outside the worktrees
 
 `.wt.env` would otherwise show up as untracked in every worktree, so `wt` adds a
@@ -599,8 +564,7 @@ done
   is the case. The push is refused if the remote branch has moved since you
   last fetched it, or holds commits that were never part of your branch, so a
   teammate's push is not overwritten. With `force_with_lease: true` every
-  push behaves this way without the flag. Permanent branches are never
-  force-pushed, and a first push stays a plain push.
+  push behaves this way without the flag, and a first push stays a plain push.
 - **Delete only removes merged branches** automatically; an unmerged branch is
   kept and the `git branch -D` command to force-delete it is printed.
 - **Indices are recycled.** Deleting worktree 2 frees index 2 (and ports 8020+)
@@ -694,14 +658,14 @@ Then `wt create ...` works from any directory.
 If the managed repo ships a Claude Code skill for `wt` (e.g. `/worktree` in
 `.claude/skills/worktree/`), Claude only loads it in sessions started inside
 that repo's checkouts. To use it in a session opened on this folder too, link it
-from a [permanent](#permanent-worktrees) worktree of the main branch:
+from the base repo:
 
 ```bash
 mkdir -p .claude/skills
-ln -s ../../wt-main/.claude/skills/worktree .claude/skills/worktree
+ln -s ../../../shallowflaws/.claude/skills/worktree .claude/skills/worktree
 ```
 
 The link is relative, so it survives moving the parent directory, and it follows
-whatever `wt-main` holds, which `wt` keeps fast-forwarded. `/.claude/skills/` is
+whatever the base repo holds, which `wt` keeps fast-forwarded. `/.claude/skills/` is
 in `.gitignore`, so the link stays local to your install. Start a new Claude
 session afterwards; skills are read when a session starts.
