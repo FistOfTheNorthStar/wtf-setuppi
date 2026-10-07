@@ -101,19 +101,6 @@ test_force_with_lease_on_a_first_push_is_a_plain_push() {
     || fail "branch was not pushed"
 }
 
-test_permanent_branches_are_never_force_pushed() {
-  base_git branch production
-  base_git push -q origin production
-  config_add <<'YML'
-permanent:
-  - production
-YML
-  wt create production --raw >/dev/null 2>&1
-  run wt push production --force-with-lease
-  assert_fails
-  assert_contains "$stderr" "never force-pushed"
-}
-
 test_rebase_gives_no_push_hint_for_an_unpushed_branch() {
   wt create one >/dev/null 2>&1
   advance_main
@@ -167,27 +154,6 @@ test_force_with_lease_config_keeps_a_fetched_but_unmerged_push() {
   assert_fails
   assert_contains "$stderr" "never part of"
   assert_eq "$(remote_head "$n")" "$theirs" "remote head"
-}
-
-# The config default skips permanent branches: they are pushed, but a
-# rewritten one is rejected like any plain push instead of overwritten.
-test_force_with_lease_config_never_force_pushes_permanent_branches() {
-  base_git branch production
-  base_git push -q origin production
-  config_add <<'YML'
-permanent:
-  - production
-YML
-  use_force_with_lease
-  local pp; pp="$(wt create production --raw 2>/dev/null)"
-  echo prod > "$pp/prod.txt"
-  run wt commit production -m prod --push
-  assert_ok
-  local pushed; pushed="$(remote_head production)"
-  git -C "$pp" commit -q --amend -m rewritten
-  run wt push production
-  assert_fails
-  assert_eq "$(remote_head production)" "$pushed" "remote head"
 }
 
 test_config_shows_force_with_lease() {

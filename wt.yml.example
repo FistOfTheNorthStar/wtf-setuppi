@@ -19,7 +19,7 @@ date_format: "%d-%m-%Y"        # WT_DATE_FORMAT    — date prefix for auto-name
 name_date: true                # WT_NAME_DATE      — include the date in auto-names (DATE-N-slug)
 name_number: true              # WT_NAME_NUMBER    — include the sequence number N in auto-names
 commit_prefix: wip             # WT_COMMIT_PREFIX  — default `wt commit` message prefix
-force_with_lease: false        # WT_FORCE_WITH_LEASE — every push uses --force-with-lease (not permanent branches)
+force_with_lease: false        # WT_FORCE_WITH_LEASE — every push uses --force-with-lease
 
 # Name of the branch on the remote once it has an issue number (create --issue,
 # push --issue, commit --push --issue). Placeholders: {issue}, {slug}, {name}
@@ -70,9 +70,3 @@ copy:                          # WT_COPY (space-separated) — per-worktree copi
 link:                          # WT_LINK (space-separated) — shared symlinks
   # - .venv
   # - node_modules
-
-# Long-lived branches (main_branch is always one). Create each once with
-# `wt create <branch> --raw`; after that `clean` and `delete` leave it alone and
-# create / rebase / clean / update keep it fast-forwarded to <remote>/<branch>.
-permanent:                     # WT_PERMANENT (space-separated)
-  # - production

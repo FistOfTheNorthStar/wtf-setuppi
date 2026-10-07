@@ -32,8 +32,8 @@
 #   wt activate <name>                   make <name> the active worktree
 #   wt active [--path]                   print the active worktree
 #   wt path <name>                       print a worktree's path
-#   wt update                            fetch remote and fast-forward main and the
-#                                        permanent branches wherever they are checked out
+#   wt update                            fetch remote and fast-forward main wherever
+#                                        it is checked out
 #   wt list [--json]                     list worktrees with status
 #   wt gitignore [--check]               sync the .gitignore rule for dir_prefix
 #   wt config                            show the resolved configuration
@@ -236,12 +236,6 @@ load_config() {
   else
     LINK_LIST="$(yml_list link "$cfg")"
   fi
-  if [ -n "${WT_PERMANENT+set}" ]; then
-    # shellcheck disable=SC2086  # deliberate split: WT_PERMANENT is space-separated
-    PERMANENT_LIST="$(printf '%s\n' ${WT_PERMANENT})"
-  else
-    PERMANENT_LIST="$(yml_list permanent "$cfg")"
-  fi
 
   [ -n "$base_repo" ] || die "wt.yml: 'base_repo' is required."
   : "${root:=.}"
@@ -317,14 +311,6 @@ cmd_config() {
   printf 'active      : %s\n' "$(active_name || echo '(none)')"
   printf 'copy        : %s\n' "$(printf '%s' "$COPY_LIST" | tr '\n' ' ')"
   printf 'link        : %s\n' "$(printf '%s' "$LINK_LIST" | tr '\n' ' ')"
-  printf 'permanent   : %s\n' "$(printf '%s' "$PERMANENT_LIST" | tr '\n' ' ')"
-}
-
-# Permanent branches (main_branch plus the `permanent:` list) are long-lived:
-# `update` keeps them fast-forwarded, and delete / clean never remove them.
-is_permanent() {
-  [ "$1" = "$MAIN_BRANCH" ] && return 0
-  printf '%s\n' "$PERMANENT_LIST" | grep -qxF -- "$1"
 }
 
 # Whether everything on <branch> is already in <remote>/<main>: either it is an
@@ -804,16 +790,11 @@ push_worktree() {
   local -a flags=()
   branch="$(git -C "$path" symbolic-ref --quiet --short HEAD)" \
     || die "Worktree '$name' is on a detached HEAD; nothing to push."
-  if [ "$force" -eq 1 ] && is_permanent "$branch"; then
-    die "'$branch' is a permanent branch; it is never force-pushed."
-  fi
-  # force_with_lease: true makes it the default, except for permanent branches.
+  # force_with_lease: true makes it the default.
   if [ "$force" -eq 0 ] && [ "$FORCE_WITH_LEASE" -eq 1 ]; then
     force=1
   fi
   if [ -n "$issue" ]; then
-    is_permanent "$branch" \
-      && die "'$branch' is a permanent branch; it is always pushed under its own name."
     git_base config "branch.$branch.wtissue" "$issue"
   fi
   issue="$(issue_get "$branch")"
@@ -957,25 +938,19 @@ run_post_create() {
   return "$rc"
 }
 
-# Fetch origin and fast-forward main and every permanent branch to their
-# remote counterparts. A branch checked out somewhere (the base repo or a
-# worktree) is fast-forwarded in place, as long as that checkout is clean.
+# Fetch origin and fast-forward main to its remote counterpart. If it is
+# checked out somewhere (the base repo or a worktree) it is fast-forwarded in
+# place, as long as that checkout is clean.
 update_main() {
   info "Fetching $REMOTE ..."
   git_base fetch --prune "$REMOTE"
 
-  ff_branch "$MAIN_BRANCH" 1
-  local b
-  while IFS= read -r b; do
-    [ -n "$b" ] && [ "$b" != "$MAIN_BRANCH" ] && ff_branch "$b" 0
-  done <<< "$PERMANENT_LIST"
-  return 0
+  ff_branch "$MAIN_BRANCH"
 }
 
-# Fast-forward local <branch> to <remote>/<branch>. A diverged main is fatal
-# (strict=1); a diverged permanent branch only warns.
+# Fast-forward local <branch> to <remote>/<branch>. A diverged branch is fatal.
 ff_branch() {
-  local b="$1" strict="$2" path
+  local b="$1" path
   if ! git_base show-ref --verify --quiet "refs/remotes/$REMOTE/$b"; then
     warn "$REMOTE/$b does not exist — skipping fast-forward of $b."
     return 0
@@ -1000,10 +975,8 @@ ff_branch() {
     ok "$b already up to date."
   elif git -C "$path" merge --ff-only "$REMOTE/$b" >&2; then
     ok "$b fast-forwarded to $REMOTE/$b."
-  elif [ "$strict" -eq 1 ]; then
-    die "Cannot fast-forward $b (diverged). Resolve manually in $path."
   else
-    warn "Cannot fast-forward $b (diverged from $REMOTE/$b). Resolve manually in $path."
+    die "Cannot fast-forward $b (diverged). Resolve manually in $path."
   fi
 }
 
@@ -1074,7 +1047,6 @@ cmd_create() {
     [ "$raw" -eq 1 ] || git_base config "branch.$name.wtslug" "$(slugify "$input")"
   fi
   if [ -n "$issue" ]; then
-    is_permanent "$name" && die "'$name' is a permanent branch; it can't take --issue."
     git_base config "branch.$name.wtissue" "$issue"
   fi
 
@@ -1148,10 +1120,6 @@ cmd_delete() {
                                } }
               ')"
 
-  if [ -n "$branch" ] && is_permanent "$branch"; then
-    die "'$branch' is a permanent worktree. Remove it from 'permanent:' in $WT_CONFIG_FILE first, or use: git -C $BASE_REPO worktree remove $path"
-  fi
-
   info "Removing worktree $path ..."
   if [ "$force" -eq 1 ]; then
     git_base worktree remove --force "$path" >&2
@@ -1209,7 +1177,8 @@ cmd_clean() {
   local skipped=0 line path branch reason
   while IFS=$'\t' read -r path branch; do
     [ -n "$path" ] || continue
-    is_permanent "$branch" && continue
+    # main is trivially contained in itself; a worktree of it is not "finished".
+    [ "$branch" = "$MAIN_BRANCH" ] && continue
     [ "$branch" = "(detached)" ] && continue
     reason=""
     if [ "$merged" -eq 1 ] && contained_in_main "$branch"; then

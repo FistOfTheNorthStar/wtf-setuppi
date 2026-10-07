@@ -2,7 +2,7 @@
 wt.yml
 
 # Per-install skill links into the managed repo, e.g.
-# .claude/skills/worktree -> ../../wt-master/.claude/skills/worktree
+# .claude/skills/worktree -> ../../../my-repo/.claude/skills/worktree
 /.claude/skills/
 
 # Dev server log and pid written by post_activate (see wt.yml).
