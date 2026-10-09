@@ -53,6 +53,7 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `copy` / `link` | Ignored files each worktree needs (`.env`, `.venv`) — see [Parallel worktrees](#parallel-worktrees-and-agents) | — |
 | `port_base` / `port_stride` | Give each worktree its own port range | off / `10` |
 | `post_create` | Command to run in a freshly created worktree | — |
+| `open_with` | Editor command `create --open` opens a new worktree with — see [`open_with`](#open_with-opens-it-in-your-editor) | — |
 | `active_link` | Stable path pointing at the active worktree — see [Activating](#activating-a-worktree) | — |
 | `pre_activate` / `post_activate` | Commands run around a switch (stop / start the server) | — |
 
@@ -94,6 +95,7 @@ force_with_lease: false        # push with --force-with-lease by default (after 
 port_base: 8000                # worktree N gets ports 8000 + N*port_stride
 port_stride: 10
 post_create: pipenv install    # run inside each new worktree
+open_with: code                # what `create --open` opens a worktree with
 copy:                          # seeded per worktree (ignored files git won't bring)
   - .env
   - .claude/settings.local.json
@@ -105,7 +107,7 @@ Every key can also be overridden per-run by its matching env var:
 `WT_BASE_REPO`, `WT_WORKTREE_ROOT`, `WT_DIR_PREFIX`, `WT_MANAGE_GITIGNORE`,
 `WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_REMOTE_BRANCH`, `WT_DATE_FORMAT`, `WT_NAME_DATE`,
 `WT_NAME_NUMBER`, `WT_COMMIT_PREFIX`, `WT_FORCE_WITH_LEASE`,
-`WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_ACTIVE_LINK`,
+`WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_OPEN_WITH`, `WT_ACTIVE_LINK`,
 `WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK`
 (space-separated). Run `./wt config` to print the resolved settings.
 
@@ -137,6 +139,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt create <slug> --from <branch>` | Same, but branch off `<branch>` (local or `origin/<branch>`) instead of `main`. |
 | `./wt create <name> --raw` | Skip auto-naming and use `<name>` verbatim as the branch/worktree name. |
 | `./wt create <slug> --issue 12345` | Same as `create`, and remember the issue: the branch is pushed as **`#12345-<slug>`**. |
+| `./wt create <slug> --open` | Same as `create`, then open the worktree in your editor with `open_with`. |
 | `./wt rebase <name>` | Update `main`, then rebase the worktree's branch onto **latest `origin/main`**. |
 | `./wt rebase <name> --onto <branch>` | Rebase onto another branch instead of `main`. |
 | `./wt commit <name>` | Stage **all** changes in the worktree and commit with a generic message (`wip: DD-MM-YYYY HH:MM`). |
@@ -353,6 +356,23 @@ post_create: 'pipenv install --dev && createdb "app_wt$WT_INDEX"'
 
 A failure is reported and leaves the worktree in place; `wt create` exits
 non-zero so a supervisor notices. Skip it for one run with `--no-hook`.
+
+### `open_with` opens it in your editor
+
+Set `open_with` to an editor command and `create --open` runs it with the new
+worktree's path as its argument, once `post_create` has finished:
+
+```yaml
+open_with: code                              # VS Code, with its `code` command installed
+open_with: 'open -a "Visual Studio Code"'    # macOS, without it
+```
+
+The worktree then gets its own editor window, which is also what keeps a
+coding agent started in that window inside the worktree. The command runs in
+the worktree with the same environment as `post_create`. A failure only warns —
+the worktree is ready either way. Without `--open` nothing is opened, so
+scripts and batches of agents can create worktrees quietly; `--open` without
+`open_with` set is refused before anything is created.
 
 ### Concurrent `create` is safe
 

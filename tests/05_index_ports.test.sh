@@ -100,6 +100,56 @@ YML
   assert_no_file "$p/should-not-exist"
 }
 
+test_open_passes_the_worktree_path_to_open_with() {
+  config_add <<'YML'
+open_with: 'printf "%s" > opened.txt'
+YML
+  run wt create opened --open
+  assert_status 0
+  assert_eq "$(cat "$stdout/opened.txt")" "$stdout" "open_with argument"
+}
+
+test_open_runs_after_post_create() {
+  config_add <<'YML'
+post_create: 'touch provisioned'
+open_with: 'test -f provisioned && touch opened; true'
+YML
+  local p; p="$(wt create opened --open 2>/dev/null)"
+  assert_file "$p/opened"
+}
+
+test_open_failure_only_warns() {
+  config_add <<'YML'
+open_with: 'no-such-editor-for-wt-tests'
+YML
+  run wt create opened --open
+  assert_status 0
+  assert_contains "$stderr" "open_with failed"
+  assert_dir "$stdout"
+}
+
+test_create_does_not_open_without_the_flag() {
+  config_add <<'YML'
+open_with: 'touch should-not-exist; true'
+YML
+  local p; p="$(wt create opened 2>/dev/null)"
+  assert_no_file "$p/should-not-exist"
+}
+
+test_open_without_open_with_is_refused() {
+  run wt create opened --open
+  assert_status 1
+  assert_contains "$stderr" "--open needs open_with"
+  assert_no_file "$TEST_TMP/host/wt-$(name_n 1 opened)"
+}
+
+test_open_with_env_overrides_and_shows_in_config() {
+  run wt config
+  assert_contains "$stdout" "open_with   : (disabled)"
+  run wtenv WT_OPEN_WITH=code -- config
+  assert_contains "$stdout" "open_with   : code"
+}
+
 test_ports_are_absent_when_port_base_is_unset() {
   wt create one >/dev/null 2>&1
   run wt list --json

@@ -13,7 +13,8 @@
 #                                        (branch off latest main, or off <branch>
 #                                        with --from; use --raw to name it verbatim;
 #                                        name_date / name_number drop either part)
-#                                        --issue <n> names it after the issue on push)
+#                                        --issue <n> names it after the issue on push;
+#                                        --open opens it in an editor, with open_with)
 #   wt delete <name> [--force] [--keep-branch]
 #                                        remove a worktree (and its branch)
 #   wt clean --merged|--gone [--dry-run] [--yes]
@@ -207,6 +208,7 @@ load_config() {
   PORT_BASE_CFG="${WT_PORT_BASE_CFG:-$(yml_get port_base "$cfg")}"
   PORT_STRIDE="${WT_PORT_STRIDE:-$(yml_get port_stride "$cfg")}"
   POST_CREATE="${WT_POST_CREATE:-$(yml_cmd post_create "$cfg")}"
+  OPEN_WITH="${WT_OPEN_WITH:-$(yml_get open_with "$cfg")}"
   PRE_ACTIVATE="${WT_PRE_ACTIVATE:-$(yml_cmd pre_activate "$cfg")}"
   POST_ACTIVATE="${WT_POST_ACTIVATE:-$(yml_cmd post_activate "$cfg")}"
   local active_link
@@ -305,6 +307,7 @@ cmd_config() {
   printf 'port_base   : %s\n' "${PORT_BASE_CFG:-(disabled)}"
   printf 'port_stride : %s\n' "$PORT_STRIDE"
   printf 'post_create : %s\n' "${POST_CREATE:-(none)}"
+  printf 'open_with   : %s\n' "${OPEN_WITH:-(disabled)}"
   printf 'active_link : %s\n' "${ACTIVE_LINK:-(disabled)}"
   printf 'pre_activate: %s\n' "${PRE_ACTIVATE:-(none)}"
   printf 'post_activate: %s\n' "${POST_ACTIVATE:-(none)}"
@@ -980,9 +983,20 @@ ff_branch() {
   fi
 }
 
+# `create --open`: open the new worktree in an editor — open_with, with the
+# path as its argument. A convenience, not provisioning — a failure warns and
+# create still succeeds.
+run_open_with() {
+  local name="$1" path="$2"
+  info "Opening with: $OPEN_WITH"
+  # shellcheck disable=SC2016  # $WT_PATH is expanded by the inner shell
+  run_in_worktree "$name" "$path" bash -c "$OPEN_WITH"' "$WT_PATH"' >&2 </dev/null \
+    || warn "open_with failed (exit $?) — open $path yourself."
+}
+
 # ---- commands -------------------------------------------------------------
 cmd_create() {
-  local input="" from="" raw=0 hook=1 activate=0 issue=""
+  local input="" from="" raw=0 hook=1 open=0 activate=0 issue=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --from|-b) from="${2:-}"; shift 2 ;;
@@ -991,12 +1005,16 @@ cmd_create() {
       --issue)   issue="$(normalize_issue "${2:-}")"; shift 2 ;;
       --issue=*) issue="$(normalize_issue "${1#*=}")"; shift ;;
       --no-hook) hook=0; shift ;;
+      --open)    open=1; shift ;;
       --activate) activate=1; shift ;;
       -*) die "Unknown flag for create: $1" ;;
       *)  if [ -z "$input" ]; then input="$1"; else die "Unexpected argument: $1"; fi; shift ;;
     esac
   done
   require_name "$input"
+  if [ "$open" -eq 1 ] && [ -z "$OPEN_WITH" ]; then
+    die "--open needs open_with set in wt.yml (e.g. open_with: code)."
+  fi
 
   update_main
 
@@ -1080,6 +1098,7 @@ cmd_create() {
     local hook_arg=(); [ "$hook" -eq 0 ] && hook_arg=(--no-hook)
     cmd_activate "$name" "${hook_arg[@]+"${hook_arg[@]}"}" >/dev/null || rc=$?
   fi
+  if [ "$open" -eq 1 ]; then run_open_with "$name" "$path"; fi
   printf '%s\n' "$path"          # stdout: the path, for scripting
   return "$rc"
 }
