@@ -143,6 +143,40 @@ test_open_without_open_with_is_refused() {
   assert_no_file "$TEST_TMP/host/wt-$(name_n 1 opened)"
 }
 
+test_open_command_opens_an_existing_worktree() {
+  config_add <<'YML'
+open_with: 'printf "%s" > opened.txt'
+YML
+  local p; p="$(wt create opened 2>/dev/null)"
+  assert_no_file "$p/opened.txt"
+  run wt open "$(name_n 1 opened)"
+  assert_status 0
+  assert_eq "$(cat "$p/opened.txt")" "$p" "open_with argument"
+}
+
+test_open_command_fails_when_open_with_fails() {
+  config_add <<'YML'
+open_with: 'no-such-editor-for-wt-tests'
+YML
+  wt create opened >/dev/null 2>&1
+  run wt open "$(name_n 1 opened)"
+  assert_status 1
+  assert_contains "$stderr" "open_with failed"
+}
+
+test_open_command_without_open_with_is_refused() {
+  wt create opened >/dev/null 2>&1
+  run wt open "$(name_n 1 opened)"
+  assert_status 1
+  assert_contains "$stderr" "open needs open_with"
+}
+
+test_open_command_rejects_an_unknown_worktree() {
+  run wtenv WT_OPEN_WITH=true -- open nope
+  assert_status 1
+  assert_contains "$stderr" "No worktree at"
+}
+
 test_open_with_env_overrides_and_shows_in_config() {
   run wt config
   assert_contains "$stdout" "open_with   : (disabled)"

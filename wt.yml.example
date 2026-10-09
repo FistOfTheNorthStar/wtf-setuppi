@@ -58,8 +58,8 @@ port_stride: 10                # WT_PORT_STRIDE    — ports reserved per worktr
 # WT_PATH, WT_INDEX, WT_PORT_BASE, WT_BASE_REPO, WT_MAIN_BRANCH.
 post_create:                   # WT_POST_CREATE    — e.g. 'pipenv install --dev'
 
-# What `create --open` opens a new worktree with: this command is run with the
-# worktree's path as its argument, after post_create.
+# What `open` and `create --open` open a worktree with: this command is run
+# with the worktree's path as its argument (on create, after post_create).
 open_with:                     # WT_OPEN_WITH      — e.g. code, or 'open -a "Visual Studio Code"'
 
 # Seconds `create` waits for a concurrent wt to finish before giving up.

@@ -53,7 +53,7 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `copy` / `link` | Ignored files each worktree needs (`.env`, `.venv`) — see [Parallel worktrees](#parallel-worktrees-and-agents) | — |
 | `port_base` / `port_stride` | Give each worktree its own port range | off / `10` |
 | `post_create` | Command to run in a freshly created worktree | — |
-| `open_with` | Editor command `create --open` opens a new worktree with — see [`open_with`](#open_with-opens-it-in-your-editor) | — |
+| `open_with` | Editor command `open` and `create --open` open a worktree with — see [`open_with`](#open_with-opens-it-in-your-editor) | — |
 | `active_link` | Stable path pointing at the active worktree — see [Activating](#activating-a-worktree) | — |
 | `pre_activate` / `post_activate` | Commands run around a switch (stop / start the server) | — |
 
@@ -95,7 +95,7 @@ force_with_lease: false        # push with --force-with-lease by default (after 
 port_base: 8000                # worktree N gets ports 8000 + N*port_stride
 port_stride: 10
 post_create: pipenv install    # run inside each new worktree
-open_with: code                # what `create --open` opens a worktree with
+open_with: code                # what `open` / `create --open` open a worktree with
 copy:                          # seeded per worktree (ignored files git won't bring)
   - .env
   - .claude/settings.local.json
@@ -158,6 +158,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt create <slug> --activate` | Create and activate in one step. |
 | `./wt active` | Print the active worktree's name (`--path` for its path). |
 | `./wt path <name>` | Print a worktree's path: `cd "$(./wt path 10-09-2026-1-add-search)"`. |
+| `./wt open <name>` | Open an existing worktree in your editor with `open_with`. |
 | `./wt exec <name> -- <cmd>` | Run a command inside one worktree, with its `WT_*` environment. |
 | `./wt each -- <cmd>` | Run a command inside every worktree (`--keep-going` to not stop at the first failure). |
 | `./wt list --json` | Same as `list`, as JSON — for scripts and orchestrators. |
@@ -373,6 +374,10 @@ the worktree with the same environment as `post_create`. A failure only warns �
 the worktree is ready either way. Without `--open` nothing is opened, so
 scripts and batches of agents can create worktrees quietly; `--open` without
 `open_with` set is refused before anything is created.
+
+`./wt open <name>` does the same for a worktree that already exists. There the
+editor is the whole point, so a failing `open_with` makes `wt open` exit
+non-zero.
 
 ### Concurrent `create` is safe
 
