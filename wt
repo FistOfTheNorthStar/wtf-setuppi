@@ -33,6 +33,7 @@
 #   wt activate <name>                   make <name> the active worktree
 #   wt active [--path]                   print the active worktree
 #   wt path <name>                       print a worktree's path
+#   wt open <name>                       open a worktree in an editor, with open_with
 #   wt update                            fetch remote and fast-forward main wherever
 #                                        it is checked out
 #   wt list [--json]                     list worktrees with status
@@ -983,15 +984,14 @@ ff_branch() {
   fi
 }
 
-# `create --open`: open the new worktree in an editor — open_with, with the
-# path as its argument. A convenience, not provisioning — a failure warns and
-# create still succeeds.
+# `open` and `create --open`: open a worktree in an editor — open_with, with
+# the path as its argument. Returns open_with's exit status; what a failure
+# means is up to the caller.
 run_open_with() {
   local name="$1" path="$2"
   info "Opening with: $OPEN_WITH"
   # shellcheck disable=SC2016  # $WT_PATH is expanded by the inner shell
-  run_in_worktree "$name" "$path" bash -c "$OPEN_WITH"' "$WT_PATH"' >&2 </dev/null \
-    || warn "open_with failed (exit $?) — open $path yourself."
+  run_in_worktree "$name" "$path" bash -c "$OPEN_WITH"' "$WT_PATH"' >&2 </dev/null
 }
 
 # ---- commands -------------------------------------------------------------
@@ -1098,7 +1098,11 @@ cmd_create() {
     local hook_arg=(); [ "$hook" -eq 0 ] && hook_arg=(--no-hook)
     cmd_activate "$name" "${hook_arg[@]+"${hook_arg[@]}"}" >/dev/null || rc=$?
   fi
-  if [ "$open" -eq 1 ]; then run_open_with "$name" "$path"; fi
+  # A convenience, not provisioning — a failure warns and create still succeeds.
+  if [ "$open" -eq 1 ]; then
+    run_open_with "$name" "$path" \
+      || warn "open_with failed (exit $?) — open $path yourself."
+  fi
   printf '%s\n' "$path"          # stdout: the path, for scripting
   return "$rc"
 }
@@ -1358,6 +1362,15 @@ cmd_path() {
   printf '%s\n' "$path"
 }
 
+cmd_open() {
+  require_name "${1:-}"
+  [ -n "$OPEN_WITH" ] || die "open needs open_with set in wt.yml (e.g. open_with: code)."
+  local path; path="$(find_wt_path "$1")"
+  [ -d "$path" ] || die "No worktree at $path"
+  run_open_with "$(name_of_path "$path")" "$path" \
+    || die "open_with failed (exit $?) — open $path yourself."
+}
+
 cmd_exec() {
   local name=""
   while [ $# -gt 0 ]; do
@@ -1497,6 +1510,7 @@ case "$cmd" in
   exec) cmd_exec "$@" ;;
   each) cmd_each "$@" ;;
   path) cmd_path "$@" ;;
+  open) cmd_open "$@" ;;
   activate|use) cmd_activate "$@" ;;
   active) cmd_active "$@" ;;
   update|update-main) update_main ;;
