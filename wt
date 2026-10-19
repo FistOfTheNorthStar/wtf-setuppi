@@ -1132,8 +1132,13 @@ cmd_delete() {
   # resolved path, while find_wt_path builds one from worktree_root, which may
   # be reached through a symlink. Parse with substr, not $2 — a worktree path
   # can contain spaces.
-  local branch="" path_phys
+  local branch="" path_phys registered
   path_phys="$(cd "$path" && pwd -P)" || path_phys="$path"
+  git_base worktree prune >&2
+  registered="$(git_base worktree list --porcelain \
+                | awk -v p1="$path" -v p2="$path_phys" '
+                    /^worktree / { w = substr($0, 10); if (w == p1 || w == p2) { print "yes"; exit } }
+                  ')"
   branch="$(git_base worktree list --porcelain \
             | awk -v p1="$path" -v p2="$path_phys" '
                 /^worktree / { w = substr($0, 10); next }
@@ -1142,16 +1147,40 @@ cmd_delete() {
                                  print b; exit
                                } }
               ')"
-
-  info "Removing worktree $path ..."
-  if [ "$force" -eq 1 ]; then
-    git_base worktree remove --force "$path" >&2
-  else
-    git_base worktree remove "$path" >&2 \
-      || die "Could not remove $path (uncommitted changes?). Re-run with --force to discard them."
-  fi
-  ok "Worktree removed."
   local gone_name; gone_name="$(name_of_path "$path")"
+
+  if [ -z "$registered" ]; then
+    # Git has already let go of this worktree (an earlier delete got partway),
+    # but the directory is still there, usually because a dev server or file
+    # watcher kept writing into it. git worktree remove would only say "not a
+    # working tree", so handle the leftovers here.
+    [ -e "$path/.git" ] \
+      && die "$path has a .git but git does not list it as a worktree; remove it by hand."
+    [ "$(cd "$path/.." && pwd -P)" = "$WT_ROOT_PHYS" ] && [ "$path_phys" != "$WT_ROOT_PHYS" ] \
+      || die "$path is not a worktree under $WT_ROOT; not touching it."
+    if [ "$force" -eq 0 ]; then
+      warn "$path is no longer a git worktree, only leftover files (git already removed it)."
+      warn "Something may still be writing into it. Check with: lsof +D \"$path\""
+      die "Stop that process, then re-run with --force to delete the folder."
+    fi
+    info "Removing leftover folder $path ..."
+    rm -rf "$path"
+    ok "Leftover folder removed."
+    # The branch is normally found through the worktree; fall back to its name.
+    if git_base show-ref --verify --quiet "refs/heads/$gone_name" \
+       && [ -z "$(branch_checkout_path "$gone_name")" ]; then
+      branch="$gone_name"
+    fi
+  else
+    info "Removing worktree $path ..."
+    if [ "$force" -eq 1 ]; then
+      git_base worktree remove --force "$path" >&2
+    else
+      git_base worktree remove "$path" >&2 \
+        || die "Could not remove $path (uncommitted changes?). Re-run with --force to discard them."
+    fi
+    ok "Worktree removed."
+  fi
   index_free "$gone_name"
   if [ "$(active_name || true)" = "$gone_name" ]; then
     active_clear
