@@ -46,6 +46,26 @@ test_delete_of_a_missing_worktree_is_a_clear_error() {
   assert_contains "$stderr" "No worktree at"
 }
 
+test_delete_of_leftover_files_explains_and_force_cleans_up() {
+  # Regression: git had already removed the worktree, but a running webpack
+  # wrote public/packs back into the folder. delete then reported git's "not a
+  # working tree" as "uncommitted changes?", and --force failed the same way.
+  local p; p="$(wt create one 2>/dev/null)"
+  wt activate "$(name_n 1 one)" >/dev/null 2>&1
+  rm -f "$p/.git"
+  mkdir -p "$p/public/packs"; echo '{}' > "$p/public/packs/manifest.json"
+  run wt delete "$(name_n 1 one)"
+  assert_fails
+  assert_contains "$stderr" "no longer a git worktree"
+  assert_not_contains "$stderr" "uncommitted changes"
+  assert_dir "$p"
+  run wt delete "$(name_n 1 one)" --force
+  assert_ok
+  assert_no_file "$p"
+  assert_branch_gone "$(name_n 1 one)"
+  assert_contains "$stderr" "nothing is active now"
+}
+
 test_delete_keeps_an_unmerged_branch_and_says_so() {
   local p; p="$(wt create one 2>/dev/null)"
   echo work > "$p/w.txt"
