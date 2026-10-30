@@ -372,7 +372,10 @@ acquire_lock() {
 INDEX_KEY='wt.worktree-index'
 
 index_get() {
-  git_base config --get-all "$INDEX_KEY" 2>/dev/null | awk -v n="$1" '$1 == n { print $2; exit }'
+  # `git config --get-all` exits 1 when no worktree has an index yet (a repo
+  # whose worktrees were all made by hand); under pipefail that killed list.
+  { git_base config --get-all "$INDEX_KEY" 2>/dev/null || true; } \
+    | awk -v n="$1" '$1 == n { print $2; exit }'
 }
 
 # Reserve the lowest free index for <name>. Call while holding the lock.

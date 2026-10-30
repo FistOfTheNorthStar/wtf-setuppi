@@ -189,3 +189,18 @@ test_ports_are_absent_when_port_base_is_unset() {
   run wt list --json
   assert_contains "$stdout" '"port_base": null'
 }
+
+test_list_and_activate_work_before_any_index_exists() {
+  # Regression: with no wt.worktree-index in the base repo at all (every
+  # worktree made by hand with git worktree add), `git config --get-all` exits
+  # 1 and pipefail killed list and activate.
+  base_git worktree add -q --no-track -b by-hand "$TEST_TMP/host/wt-by-hand" origin/main
+  run wt list
+  assert_ok
+  assert_contains "$stdout" 'by-hand'
+  run wt list --json
+  assert_ok
+  assert_contains "$stdout" '"name": "by-hand"'
+  run wt activate by-hand
+  assert_ok
+}
