@@ -20,6 +20,7 @@
 #                                        running pre_delete first
 #   wt clean --merged|--gone [--dry-run] [--yes] [--no-hook]
 #                                        remove finished worktrees in bulk
+#                                        (wt clear is an alias)
 #   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
 #   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
 #   wt push <name> [--issue <n>] [--force-with-lease]
@@ -979,8 +980,9 @@ ff_branch() {
     return 0
   fi
 
-  if [ -n "$(git -C "$path" status --porcelain)" ]; then
-    warn "$path is dirty on $b — skipping fast-forward."
+  # Untracked files don't count: merge --ff-only refuses to overwrite them.
+  if [ -n "$(git -C "$path" status --porcelain --untracked-files=no)" ]; then
+    warn "$path has uncommitted changes on $b — skipping fast-forward."
     return 0
   fi
   if git -C "$path" merge-base --is-ancestor "$REMOTE/$b" "$b"; then
@@ -988,7 +990,7 @@ ff_branch() {
   elif git -C "$path" merge --ff-only "$REMOTE/$b" >&2; then
     ok "$b fast-forwarded to $REMOTE/$b."
   else
-    die "Cannot fast-forward $b (diverged). Resolve manually in $path."
+    die "Cannot fast-forward $b (diverged, or an untracked file is in the way). Resolve manually in $path."
   fi
 }
 
@@ -1563,7 +1565,7 @@ git_base rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 case "$cmd" in
   create) cmd_create "$@" ;;
   delete|rm|remove) cmd_delete "$@" ;;
-  clean) cmd_clean "$@" ;;
+  clean|clear) cmd_clean "$@" ;;
   rebase) cmd_rebase "$@" ;;
   commit) cmd_commit "$@" ;;
   push) cmd_push "$@" ;;

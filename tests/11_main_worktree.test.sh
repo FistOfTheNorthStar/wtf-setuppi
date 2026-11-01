@@ -40,6 +40,30 @@ test_update_fast_forwards_a_main_worktree_in_place() {
   assert_file "$TEST_TMP/host/wt-main/m1.txt"
 }
 
+test_update_fast_forwards_past_untracked_files() {
+  base_git switch -q --detach
+  local p="$TEST_TMP/host/wt-main"
+  wt create main --raw >/dev/null 2>&1
+  echo junk > "$p/.DS_Store"
+  advance_remote main m1
+  run wt update
+  assert_ok
+  assert_file "$p/m1.txt"
+  assert_file "$p/.DS_Store"
+}
+
+test_update_skips_a_main_worktree_with_uncommitted_changes() {
+  base_git switch -q --detach
+  local p="$TEST_TMP/host/wt-main"
+  wt create main --raw >/dev/null 2>&1
+  echo edited >> "$p/$(git -C "$p" ls-files | head -1)"
+  advance_remote main m1
+  run wt update
+  assert_ok
+  assert_contains "$stderr" "uncommitted changes"
+  assert_no_file "$p/m1.txt"
+}
+
 test_update_leaves_other_branches_alone() {
   base_git branch production
   base_git push -q origin production
