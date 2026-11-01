@@ -160,6 +160,17 @@ test_clean_merged_lists_and_removes() {
   assert_no_file "$TEST_TMP/host/wt-$(name_n 2 two)"
 }
 
+test_clear_is_an_alias_for_clean() {
+  wt create one >/dev/null 2>&1
+  run wt clear --merged --dry-run
+  assert_ok
+  assert_contains "$stdout" "$(name_n 1 one)"
+  assert_dir "$TEST_TMP/host/wt-$(name_n 1 one)"
+  run wt clear --merged --yes
+  assert_ok
+  assert_no_file "$TEST_TMP/host/wt-$(name_n 1 one)"
+}
+
 test_clean_skips_dirty_worktrees() {
   local p; p="$(wt create one 2>/dev/null)"
   echo dirt > "$p/dirty.txt"

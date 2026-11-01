@@ -20,6 +20,7 @@
 #                                        running pre_delete first
 #   wt clean --merged|--gone [--dry-run] [--yes] [--no-hook]
 #                                        remove finished worktrees in bulk
+#                                        (wt clear is an alias)
 #   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
 #   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
 #   wt push <name> [--issue <n>] [--force-with-lease]
@@ -1564,7 +1565,7 @@ git_base rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 case "$cmd" in
   create) cmd_create "$@" ;;
   delete|rm|remove) cmd_delete "$@" ;;
-  clean) cmd_clean "$@" ;;
+  clean|clear) cmd_clean "$@" ;;
   rebase) cmd_rebase "$@" ;;
   commit) cmd_commit "$@" ;;
   push) cmd_push "$@" ;;

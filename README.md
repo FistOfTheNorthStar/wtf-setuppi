@@ -153,7 +153,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
 | `./wt delete <name> --no-hook` | Skip `pre_delete` (also `clean --no-hook`). |
-| `./wt clean --merged` | Remove every worktree whose branch is contained in `main`, however it was merged (asks first). |
+| `./wt clean --merged` | Remove every worktree whose branch is contained in `main`, however it was merged (asks first). `./wt clear` is an alias for `clean`. |
 | `./wt clean --gone` | Same, for branches whose remote was deleted — catches squash-merged PRs. |
 | `./wt clean --merged --dry-run` | List what would be removed. Add `--yes` to skip the prompt. |
 | `./wt activate <name>` | Make it the active worktree: run `pre_activate`, repoint `active_link`, run `post_activate`. |
