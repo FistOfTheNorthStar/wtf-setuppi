@@ -45,6 +45,12 @@ active_link:                   # WT_ACTIVE_LINK    — e.g. ./current
 pre_activate:                  # WT_PRE_ACTIVATE   — e.g. stop the server, run migrations
 post_activate:                 # WT_POST_ACTIVATE  — e.g. start the server again
 
+# `wt delete` (and `wt clean`, per worktree) runs pre_delete INSIDE the
+# worktree just before removing it, with the post_create environment, so a
+# server started from that tree can be stopped rather than left running from a
+# deleted folder. A failing pre_delete aborts the delete; --no-hook skips it.
+pre_delete:                    # WT_PRE_DELETE     — e.g. 'overmind quit'
+
 # ---- running several worktrees (or agents) at once ------------------------
 
 # Each worktree gets a stable index (1, 2, 3 ...). With port_base set it also

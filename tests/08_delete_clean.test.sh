@@ -82,6 +82,65 @@ test_delete_prints_nothing_on_stdout() {
   assert_empty "$stdout" "delete stdout"
 }
 
+test_pre_delete_runs_inside_the_worktree_before_removal() {
+  # The hook must see the tree still on disk, or it cannot find (and stop) a
+  # server started from it.
+  local p; p="$(wt create one 2>/dev/null)"
+  config_add <<'YML'
+pre_delete: 'printf "%s:%s:%s\n" "$WT_NAME" "$(pwd -P)" "$(cat file.txt)" >> "$WT_BASE_REPO/trace"'
+YML
+  local real; real="$(cd "$p" && pwd -P)"
+  run wt delete "$(name_n 1 one)"
+  assert_ok
+  assert_empty "$stdout" "delete stdout"
+  assert_eq "$(cat "$TEST_TMP/base/trace")" "$(name_n 1 one):$real:hello" "pre_delete trace"
+  assert_no_file "$p"
+}
+
+test_failing_pre_delete_keeps_the_worktree() {
+  local p; p="$(wt create one 2>/dev/null)"
+  run wtenv WT_PRE_DELETE='exit 3' -- delete "$(name_n 1 one)"
+  assert_fails
+  assert_contains "$stderr" "pre_delete failed (exit 3)"
+  assert_dir "$p"
+  assert_branch_exists "$(name_n 1 one)"
+  run wtenv WT_PRE_DELETE='exit 3' -- delete "$(name_n 1 one)" --no-hook
+  assert_ok
+  assert_no_file "$p"
+}
+
+test_pre_delete_does_not_run_when_delete_would_be_refused() {
+  local p; p="$(wt create one 2>/dev/null)"
+  echo dirt > "$p/dirty.txt"
+  run wtenv WT_PRE_DELETE='touch "$WT_BASE_REPO/ran"' -- delete "$(name_n 1 one)"
+  assert_fails
+  assert_contains "$stderr" "uncommitted changes"
+  assert_no_file "$TEST_TMP/base/ran"
+  assert_dir "$p"
+}
+
+test_pre_delete_runs_before_removing_leftover_files() {
+  local p; p="$(wt create one 2>/dev/null)"
+  rm -f "$p/.git"
+  run wtenv WT_PRE_DELETE='echo "$WT_NAME" >> "$WT_BASE_REPO/trace"' -- delete "$(name_n 1 one)" --force
+  assert_ok
+  assert_eq "$(cat "$TEST_TMP/base/trace")" "$(name_n 1 one)" "pre_delete trace"
+  assert_no_file "$p"
+}
+
+test_clean_runs_pre_delete_for_each_worktree() {
+  wt create one >/dev/null 2>&1
+  wt create two >/dev/null 2>&1
+  run wtenv WT_PRE_DELETE='echo "$WT_NAME" >> "$WT_BASE_REPO/trace"' -- clean --merged --yes
+  assert_ok
+  assert_contains "$(cat "$TEST_TMP/base/trace")" "$(name_n 1 one)"
+  assert_contains "$(cat "$TEST_TMP/base/trace")" "$(name_n 2 two)"
+  wt create three >/dev/null 2>&1
+  run wtenv WT_PRE_DELETE='exit 1' -- clean --merged --yes --no-hook
+  assert_ok
+  assert_no_file "$TEST_TMP/host/wt-$(name_n 3 three)"
+}
+
 test_clean_needs_a_selector() {
   run wt clean
   assert_fails

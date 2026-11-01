@@ -15,9 +15,10 @@
 #                                        name_date / name_number drop either part)
 #                                        --issue <n> names it after the issue on push;
 #                                        --open opens it in an editor, with open_with)
-#   wt delete <name> [--force] [--keep-branch]
-#                                        remove a worktree (and its branch)
-#   wt clean --merged|--gone [--dry-run] [--yes]
+#   wt delete <name> [--force] [--keep-branch] [--no-hook]
+#                                        remove a worktree (and its branch),
+#                                        running pre_delete first
+#   wt clean --merged|--gone [--dry-run] [--yes] [--no-hook]
 #                                        remove finished worktrees in bulk
 #   wt rebase <name> [--onto <branch>]   rebase a worktree onto latest main (or <branch>)
 #   wt commit <name> [-m <msg>] [--push] stage all changes and commit (generic msg by default)
@@ -61,6 +62,8 @@
 #   - `activate` points active_link at one worktree and runs pre_activate /
 #     post_activate around the switch, so a dev server can be restarted (or a
 #     reverse proxy reloaded) against the newly active tree.
+#   - `delete` runs pre_delete inside the worktree before removing it, so a
+#     server started from that tree can be stopped instead of left orphaned.
 #
 set -euo pipefail
 
@@ -212,6 +215,7 @@ load_config() {
   OPEN_WITH="${WT_OPEN_WITH:-$(yml_get open_with "$cfg")}"
   PRE_ACTIVATE="${WT_PRE_ACTIVATE:-$(yml_cmd pre_activate "$cfg")}"
   POST_ACTIVATE="${WT_POST_ACTIVATE:-$(yml_cmd post_activate "$cfg")}"
+  PRE_DELETE="${WT_PRE_DELETE:-$(yml_cmd pre_delete "$cfg")}"
   local active_link
   active_link="${WT_ACTIVE_LINK:-$(yml_get active_link "$cfg")}"
   # dir_prefix may legitimately be set to "" to disable prefixing, so only fall
@@ -312,6 +316,7 @@ cmd_config() {
   printf 'active_link : %s\n' "${ACTIVE_LINK:-(disabled)}"
   printf 'pre_activate: %s\n' "${PRE_ACTIVATE:-(none)}"
   printf 'post_activate: %s\n' "${POST_ACTIVATE:-(none)}"
+  printf 'pre_delete  : %s\n' "${PRE_DELETE:-(none)}"
   printf 'active      : %s\n' "$(active_name || echo '(none)')"
   printf 'copy        : %s\n' "$(printf '%s' "$COPY_LIST" | tr '\n' ' ')"
   printf 'link        : %s\n' "$(printf '%s' "$LINK_LIST" | tr '\n' ' ')"
@@ -1110,12 +1115,26 @@ cmd_create() {
   return "$rc"
 }
 
+# Run pre_delete inside a worktree that is about to be removed, e.g. to stop a
+# server started from it. Its output goes to stderr (delete keeps stdout empty).
+# A failure aborts the delete: removing the folder under a process that is
+# still running is what leaves an orphan holding the port.
+run_pre_delete() {
+  local name="$1" path="$2" rc=0
+  [ -n "$PRE_DELETE" ] || return 0
+  info "Running pre_delete ..."
+  run_in_worktree "$name" "$path" bash -c "$PRE_DELETE" >&2 || rc=$?
+  [ "$rc" -eq 0 ] \
+    || die "pre_delete failed (exit $rc) — not deleting. Fix it, or re-run with --no-hook."
+}
+
 cmd_delete() {
-  local name="" force=0 keep_branch=0
+  local name="" force=0 keep_branch=0 hook=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --force|-f)     force=1; shift ;;
       --keep-branch)  keep_branch=1; shift ;;
+      --no-hook)      hook=0; shift ;;
       -*) die "Unknown flag for delete: $1" ;;
       *)  if [ -z "$name" ]; then name="$1"; else die "Unexpected argument: $1"; fi; shift ;;
     esac
@@ -1166,6 +1185,7 @@ cmd_delete() {
       warn "Something may still be writing into it. Check with: lsof +D \"$path\""
       die "Stop that process, then re-run with --force to delete the folder."
     fi
+    [ "$hook" -eq 1 ] && run_pre_delete "$gone_name" "$path"
     info "Removing leftover folder $path ..."
     rm -rf "$path"
     ok "Leftover folder removed."
@@ -1175,6 +1195,12 @@ cmd_delete() {
       branch="$gone_name"
     fi
   else
+    # Check for changes before pre_delete, so a delete that git is going to
+    # refuse doesn't stop the server first.
+    if [ "$force" -eq 0 ] && [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then
+      die "$path has uncommitted changes. Re-run with --force to discard them."
+    fi
+    [ "$hook" -eq 1 ] && run_pre_delete "$gone_name" "$path"
     info "Removing worktree $path ..."
     if [ "$force" -eq 1 ]; then
       git_base worktree remove --force "$path" >&2
@@ -1212,7 +1238,7 @@ cmd_delete() {
 # Bulk-remove finished worktrees: branches merged into main (--merged) and/or
 # branches whose upstream has been deleted (--gone, i.e. squash-merged PRs).
 cmd_clean() {
-  local merged=0 gone=0 dry=0 yes=0 keep_branch=0
+  local merged=0 gone=0 dry=0 yes=0 keep_branch=0 hook=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --merged)      merged=1; shift ;;
@@ -1220,6 +1246,7 @@ cmd_clean() {
       --dry-run|-n)  dry=1; shift ;;
       --yes|-y)      yes=1; shift ;;
       --keep-branch) keep_branch=1; shift ;;
+      --no-hook)     hook=0; shift ;;
       *) die "Unknown flag for clean: $1" ;;
     esac
   done
@@ -1283,6 +1310,7 @@ cmd_clean() {
 
   local -a delete_args=()
   [ "$keep_branch" -eq 1 ] && delete_args+=(--keep-branch)
+  [ "$hook" -eq 0 ] && delete_args+=(--no-hook)
   for i in "${!victims[@]}"; do
     cmd_delete "$(name_of_path "${victims[$i]}")" "${delete_args[@]+"${delete_args[@]}"}"
   done
