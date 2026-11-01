@@ -56,6 +56,7 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `open_with` | Editor command `open` and `create --open` open a worktree with — see [`open_with`](#open_with-opens-it-in-your-editor) | — |
 | `active_link` | Stable path pointing at the active worktree — see [Activating](#activating-a-worktree) | — |
 | `pre_activate` / `post_activate` | Commands run around a switch (stop / start the server) | — |
+| `pre_delete` | Command run inside a worktree just before `delete` / `clean` removes it (stop its server) — see [Cleaning up](#cleaning-up) | — |
 
 Then check that it resolved the way you expect, and create your first worktree:
 
@@ -108,10 +109,10 @@ Every key can also be overridden per-run by its matching env var:
 `WT_MAIN_BRANCH`, `WT_REMOTE`, `WT_REMOTE_BRANCH`, `WT_DATE_FORMAT`, `WT_NAME_DATE`,
 `WT_NAME_NUMBER`, `WT_COMMIT_PREFIX`, `WT_FORCE_WITH_LEASE`,
 `WT_PORT_BASE_CFG`, `WT_PORT_STRIDE`, `WT_POST_CREATE`, `WT_OPEN_WITH`, `WT_ACTIVE_LINK`,
-`WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, and `WT_COPY` / `WT_LINK`
+`WT_PRE_ACTIVATE`, `WT_POST_ACTIVATE`, `WT_PRE_DELETE`, and `WT_COPY` / `WT_LINK`
 (space-separated). Run `./wt config` to print the resolved settings.
 
-The three command keys (`post_create`, `pre_activate`, `post_activate`) accept a
+The command keys (`post_create`, `pre_activate`, `post_activate`, `pre_delete`) accept a
 YAML block scalar, so a multi-line hook doesn't have to be crammed onto one line:
 
 ```yaml
@@ -151,6 +152,7 @@ Run from inside `wt-shallowflaws/`:
 | `./wt delete <name>` | Remove the worktree and delete its branch (only if it is contained in `origin/main`). |
 | `./wt delete <name> --force` | Also discard uncommitted changes in the worktree. |
 | `./wt delete <name> --keep-branch` | Remove the worktree but keep the branch. |
+| `./wt delete <name> --no-hook` | Skip `pre_delete` (also `clean --no-hook`). |
 | `./wt clean --merged` | Remove every worktree whose branch is contained in `main`, however it was merged (asks first). |
 | `./wt clean --gone` | Same, for branches whose remote was deleted — catches squash-merged PRs. |
 | `./wt clean --merged --dry-run` | List what would be removed. Add `--yes` to skip the prompt. |
@@ -427,6 +429,23 @@ with uncommitted changes are always skipped and reported. On a terminal `clean`
 lists what it will remove and asks for confirmation; with no terminal (a script,
 CI, an agent) it refuses to proceed unless you pass `--yes`.
 
+#### `pre_delete` stops what the worktree started
+
+A server or file watcher started from a worktree keeps running after its folder
+is gone — still holding its port, and sometimes writing files back into the
+deleted path. `pre_delete` runs **inside the worktree, just before it is
+removed** (by `delete`, and by `clean` for each worktree), with the same
+environment as `post_create`, so it can stop whatever was started there:
+
+```yaml
+pre_delete: |
+  if [ -S .overmind.sock ]; then overmind quit; fi
+```
+
+A failing `pre_delete` aborts the delete and leaves the worktree and branch
+alone; `--no-hook` skips it. It does not run when the delete is going to be
+refused anyway (uncommitted changes without `--force`).
+
 ### One file wt writes outside the worktrees
 
 `.wt.env` would otherwise show up as untracked in every worktree, so `wt` adds a
@@ -518,8 +537,9 @@ Both hooks run **inside the incoming worktree** and receive its `WT_NAME`,
   `.gitignore` block automatically.
 - If the path exists and is *not* a symlink, `wt` refuses to touch it.
 - Deleting the active worktree clears the marker and removes the dangling link.
-  Its server is **not** stopped, though — and if the PID file lived inside that
-  worktree it is gone too, leaving an orphan holding the port. Keep the PID
+  Its server is only stopped if [`pre_delete`](#pre_delete-stops-what-the-worktree-started)
+  does it — otherwise, if the PID file lived inside that worktree it is gone
+  too, leaving an orphan holding the port. Use `pre_delete`, keep the PID
   outside the tree (`"$WT_BASE_REPO/.wt-server-$WT_INDEX.pid"`), or have
   `pre_activate` kill by port (`lsof -ti :8000 | xargs -r kill`) so a stale
   process can never outlive the worktree that started it.
