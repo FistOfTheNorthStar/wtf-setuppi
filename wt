@@ -705,6 +705,18 @@ name_of_path() {
 
 require_name() { [ -n "${1:-}" ] || die "Missing <name>."; }
 
+# Die unless $1 is a worktree the base repo knows about. A bare directory is not
+# enough: when a worktree is removed, git-ignored files (build output, editor
+# caches) can be left behind in its folder. Commands run there would find no
+# app code, and git inside it would resolve to whatever repo encloses it.
+require_worktree() {
+  local path="$1" phys
+  [ -d "$path" ] || die "No worktree at $path"
+  phys="$(cd "$path" && pwd -P)"
+  git_base worktree list --porcelain | grep -qxF "worktree $phys" \
+    || die "$path is not a git worktree (only a leftover folder). Remove it, or recreate the worktree with 'wt create'."
+}
+
 # Turn arbitrary text into a lowercase dash-slug: "Add Search!" -> "add-search".
 slugify() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
