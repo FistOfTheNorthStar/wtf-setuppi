@@ -18,6 +18,7 @@ remote: origin                 # WT_REMOTE         — git remote to fetch/push
 date_format: "%d-%m-%Y"        # WT_DATE_FORMAT    — date prefix for auto-named branches (strftime)
 name_date: true                # WT_NAME_DATE      — include the date in auto-names (DATE-N-slug)
 name_number: true              # WT_NAME_NUMBER    — include the sequence number N in auto-names
+name_scan_remote: true         # WT_NAME_SCAN_REMOTE — N also skips numbers on the remote's branches
 commit_prefix: wip             # WT_COMMIT_PREFIX  — default `wt commit` message prefix
 force_with_lease: false        # WT_FORCE_WITH_LEASE — every push uses --force-with-lease
 

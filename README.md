@@ -47,6 +47,7 @@ relative to `wt.yml`, or an absolute one). The rest have working defaults:
 | `remote` | The remote to fetch/push, if it isn't `origin` | `origin` |
 | `date_format` | `strftime` format for the date in auto-named branches | `%d-%m-%Y` |
 | `name_date` / `name_number` | Include the date / the sequence number in auto-names — see [Naming](#naming) | `true` / `true` |
+| `name_scan_remote` | Let `N` skip numbers already used by branches on the remote — see [Naming](#naming) | `true` |
 | `commit_prefix` | Prefix for `wt commit`'s default message | `wip` |
 | `remote_branch` | Name of the pushed branch once it has an issue number — see [Issue numbers](#issue-numbers) | `"#{issue}-{slug}"` |
 | `force_with_lease` | Make every push a `--force-with-lease` push (as if the flag were passed), so a rebased branch goes through | `false` |
@@ -89,6 +90,7 @@ remote: origin                 # git remote to fetch/push
 date_format: "%d-%m-%Y"        # date prefix for auto-named branches (strftime)
 name_date: true                # include the date in auto-names
 name_number: true              # include the sequence number in auto-names
+name_scan_remote: true         # N skips numbers already on the remote's branches
 commit_prefix: wip             # default `wt commit` message prefix
 remote_branch: "#{issue}-{slug}"   # branch name on the remote, given an issue number
 force_with_lease: false        # push with --force-with-lease by default (after rebases)
@@ -205,8 +207,11 @@ name. Give a branch an issue number and it is pushed under a different name,
 **`DD-MM-YYYY-N-slug`** (e.g. `10-09-2026-1-add-search`):
 
 - **`DD-MM-YYYY`** — today's date.
-- **`N`** — the next unused sequence number for today (looks at existing
-  branches *and* worktree dirs, so gaps from deletions don't reuse a number).
+- **`N`** — the next unused sequence number for today (looks at local
+  branches, the remote's branches as of the fetch `create` does, *and*
+  worktree dirs, so neither a teammate's pushed branch nor a gap from a
+  deletion gets its number reused; `name_scan_remote: false` leaves the
+  remote out).
 - **`slug`** — your text, lowercased with non-alphanumerics collapsed to dashes
   (`"Add Search!"` → `add-search`).
 
