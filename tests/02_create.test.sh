@@ -116,3 +116,21 @@ test_bad_name_date_is_rejected() {
   assert_fails
   assert_contains "$stderr" "name_date must be true or false"
 }
+
+test_sequence_number_skips_numbers_already_on_the_remote() {
+  # A teammate pushed today's 4: it was never checked out here.
+  base_git push -q origin "main:refs/heads/$(name_n 4 teammate)"
+  run wt create mine
+  assert_ok
+  assert_contains "$stdout" "wt-$(name_n 5 mine)"
+}
+
+test_name_scan_remote_false_ignores_the_remote() {
+  config_add <<'YML'
+name_scan_remote: false
+YML
+  base_git push -q origin "main:refs/heads/$(name_n 4 teammate)"
+  run wt create mine
+  assert_ok
+  assert_contains "$stdout" "wt-$(name_n 1 mine)"
+}

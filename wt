@@ -12,7 +12,8 @@
 #   wt create <slug> [--from <branch>]   create a worktree named <date>-N-<slug>
 #                                        (branch off latest main, or off <branch>
 #                                        with --from; use --raw to name it verbatim;
-#                                        name_date / name_number drop either part)
+#                                        name_date / name_number drop either part;
+#                                        N also skips numbers already on the remote)
 #                                        --issue <n> names it after the issue on push;
 #                                        --open opens it in an editor, with open_with)
 #   wt delete <name> [--force] [--keep-branch] [--no-hook]
@@ -207,6 +208,7 @@ load_config() {
   DATE_FMT="${WT_DATE_FORMAT:-$(yml_get date_format "$cfg")}"
   NAME_DATE="${WT_NAME_DATE:-$(yml_get name_date "$cfg")}"
   NAME_NUMBER="${WT_NAME_NUMBER:-$(yml_get name_number "$cfg")}"
+  NAME_SCAN_REMOTE="${WT_NAME_SCAN_REMOTE:-$(yml_get name_scan_remote "$cfg")}"
   COMMIT_PREFIX="${WT_COMMIT_PREFIX:-$(yml_get commit_prefix "$cfg")}"
   FORCE_WITH_LEASE="${WT_FORCE_WITH_LEASE:-$(yml_get force_with_lease "$cfg")}"
   REMOTE_BRANCH_FMT="${WT_REMOTE_BRANCH:-$(yml_get remote_branch "$cfg")}"
@@ -252,6 +254,7 @@ load_config() {
   : "${DATE_FMT:=%d-%m-%Y}"
   : "${NAME_DATE:=true}"
   : "${NAME_NUMBER:=true}"
+  : "${NAME_SCAN_REMOTE:=true}"
   : "${COMMIT_PREFIX:=wip}"
   : "${FORCE_WITH_LEASE:=false}"
   [ -n "$REMOTE_BRANCH_FMT" ] || REMOTE_BRANCH_FMT='#{issue}-{slug}'
@@ -266,6 +269,7 @@ load_config() {
   MANAGE_GITIGNORE="$(parse_bool manage_gitignore "$MANAGE_GITIGNORE")"
   NAME_DATE="$(parse_bool name_date "$NAME_DATE")"
   NAME_NUMBER="$(parse_bool name_number "$NAME_NUMBER")"
+  NAME_SCAN_REMOTE="$(parse_bool name_scan_remote "$NAME_SCAN_REMOTE")"
   FORCE_WITH_LEASE="$(parse_bool force_with_lease "$FORCE_WITH_LEASE")"
   if [ -n "$PORT_BASE_CFG" ]; then
     case "$PORT_BASE_CFG" in
@@ -307,6 +311,7 @@ cmd_config() {
   printf 'date_format : %s\n' "$DATE_FMT"
   printf 'name_date   : %s\n' "$( [ "$NAME_DATE" -eq 1 ] && echo true || echo false )"
   printf 'name_number : %s\n' "$( [ "$NAME_NUMBER" -eq 1 ] && echo true || echo false )"
+  printf 'name_scan_remote: %s\n' "$( [ "$NAME_SCAN_REMOTE" -eq 1 ] && echo true || echo false )"
   printf 'commit_prefix: %s\n' "$COMMIT_PREFIX"
   printf 'force_with_lease: %s\n' "$( [ "$FORCE_WITH_LEASE" -eq 1 ] && echo true || echo false )"
   printf 'remote_branch: %s\n' "$REMOTE_BRANCH_FMT"
@@ -743,6 +748,17 @@ generate_name() {
       (( n > max )) && max="$n"
     fi
   done < <(git_base for-each-ref --format='%(refname:short)' refs/heads)
+  # And the remote's branches (fetched just before), so a number a teammate
+  # already pushed isn't handed out again. name_scan_remote: false skips it.
+  if [ "$NAME_SCAN_REMOTE" -eq 1 ]; then
+    while IFS= read -r branch; do
+      branch="${branch#"$REMOTE"/}"
+      if [[ "$branch" =~ ^${prefix}([0-9]+)- ]]; then
+        n="${BASH_REMATCH[1]}"
+        (( n > max )) && max="$n"
+      fi
+    done < <(git_base for-each-ref --format='%(refname:short)' "refs/remotes/$REMOTE")
+  fi
   # Also scan worktree dirs, in case a branch was already deleted. Both
   # prefixed and legacy unprefixed directories count.
   local d base
